@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MsgHub 留言汇</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+
+<!-- 登录 -->
+<div id="login" class="login hidden">
+  <form id="loginForm" class="card login-card">
+    <h1>MsgHub <small>留言汇</small></h1>
+    <p class="muted">网站留言统一管理平台</p>
+    <input type="password" name="password" placeholder="管理密码" required autofocus>
+    <button class="btn primary" type="submit">登录</button>
+    <div class="err" id="loginErr"></div>
+  </form>
+</div>
+
+<!-- 主界面 -->
+<div id="app" class="hidden">
+  <header class="top">
+    <div class="brand">MsgHub <small>留言汇</small></div>
+    <nav>
+      <a href="#chats" data-view="chats">对话 <span id="navUnread" class="nav-badge hidden"></span></a>
+      <a href="#messages" data-view="messages">留言</a>
+      <a href="#sites" data-view="sites">站点</a>
+    </nav>
+    <button class="btn ghost" id="logout">退出</button>
+  </header>
+
+  <main>
+    <section id="stats" class="stats"></section>
+
+    <!-- 对话 -->
+    <section id="view-chats" class="view">
+      <div class="chat-layout card">
+        <aside class="conv-pane">
+          <div class="conv-tools">
+            <select id="cStatus">
+              <option value="open">进行中</option>
+              <option value="closed">已结束</option>
+              <option value="">全部</option>
+            </select>
+            <input id="cQ" placeholder="搜索 #编号 / 称呼 / 内容">
+          </div>
+          <div id="convList" class="conv-list"></div>
+          <div id="liveState" class="live-state muted">实时连接中…</div>
+        </aside>
+        <section class="chat-pane" id="chatPane">
+          <div class="chat-empty muted">选择左侧的会话开始回复</div>
+        </section>
+      </div>
+    </section>
+
+    <!-- 留言 -->
+    <section id="view-messages" class="view hidden">
+      <div class="toolbar">
+        <select id="fSite"><option value="">全部站点</option></select>
+        <select id="fStatus">
+          <option value="">全部状态</option>
+          <option value="new">未读</option>
+          <option value="read">已读</option>
+          <option value="handled">已处理</option>
+          <option value="spam">垃圾</option>
+        </select>
+        <input id="fQ" placeholder="搜索内容 / 姓名 / 联系方式">
+        <button class="btn" id="btnSearch">搜索</button>
+        <span class="spacer"></span>
+        <select id="batchAction">
+          <option value="">批量操作…</option>
+          <option value="read">标为已读</option>
+          <option value="handled">标为已处理</option>
+          <option value="spam">标为垃圾</option>
+          <option value="delete">删除</option>
+        </select>
+        <button class="btn" id="btnExport">导出 CSV</button>
+      </div>
+      <div class="card table-wrap">
+        <table>
+          <thead><tr>
+            <th class="w-chk"><input type="checkbox" id="chkAll"></th>
+            <th>站点</th><th>姓名 / 联系方式</th><th>内容</th><th>状态</th><th>时间</th>
+          </tr></thead>
+          <tbody id="msgBody"></tbody>
+        </table>
+      </div>
+      <div class="pager" id="pager"></div>
+    </section>
+
+    <!-- 站点 -->
+    <section id="view-sites" class="view hidden">
+      <div id="qqCard" class="card qq-card"></div>
+      <div class="toolbar">
+        <span class="muted">每个接入网站对应一个站点，使用独立的 Site Key 提交留言。</span>
+        <span class="spacer"></span>
+        <button class="btn primary" id="btnNewSite">+ 新建站点</button>
+      </div>
+      <div id="siteList" class="site-list"></div>
+    </section>
+  </main>
+</div>
+
+<!-- 留言详情 -->
+<div id="drawer" class="drawer hidden">
+  <div class="drawer-panel card">
+    <div class="drawer-head"><h3>留言详情</h3><button class="btn ghost" data-close>✕</button></div>
+    <div id="drawerBody"></div>
+  </div>
+</div>
+
+<!-- 站点编辑 -->
+<div id="siteModal" class="drawer hidden">
+  <form class="drawer-panel card" id="siteForm">
+    <div class="drawer-head"><h3 id="siteModalTitle">新建站点</h3><button type="button" class="btn ghost" data-close>✕</button></div>
+    <label>站点名称 *<input name="name" required></label>
+    <label>域名<input name="domain" placeholder="example.com"></label>
+    <label>允许的来源（Origin）
+      <input name="allowed_origins" placeholder="https://example.com,https://www.example.com">
+      <small class="muted">逗号分隔；留空表示不限制。</small>
+    </label>
+    <label>Webhook 推送地址
+      <input name="webhook_url" placeholder="https://… （有新留言时 POST JSON）">
+    </label>
+    <label class="row"><input type="checkbox" name="enabled" checked> 启用</label>
+    <button class="btn primary" type="submit">保存</button>
+  </form>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/static/admin.js"></script>
+</body>
+</html>

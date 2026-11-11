@@ -1,0 +1,32 @@
+# MsgHub 留言汇 —— Docker 部署
+#
+#   1. cp .env.example .env   并设置 ADMIN_PASSWORD
+#   2. docker compose up -d --build
+#   3. 打开 http://127.0.0.1:20100
+#
+# 数据全部在 ./data（SQLite 数据库 + 签名密钥），备份这个目录即可。
+# 网站需要能访问到提交接口，公网使用请放在 HTTPS 反向代理后面。
+
+services:
+  msghub:
+    build: .
+    image: msghub:latest
+    container_name: msghub
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-20100}:20100"
+    volumes:
+      - ./data:/data
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?请先 cp .env.example .env 并设置 ADMIN_PASSWORD}
+      SECRET_KEY:
+      RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-5}
+      # QQ 官方机器人（q.qq.com → 开发设置）。不填则只能在网页后台回复
+      QQ_APP_ID: ${QQ_APP_ID:-}
+      QQ_APP_SECRET: ${QQ_APP_SECRET:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
