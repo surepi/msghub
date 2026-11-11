@@ -89,6 +89,7 @@
     var host = cfg.target && document.querySelector(cfg.target);
     if (host) { box.classList.add("mh-inline"); host.appendChild(box); return { inline: true }; }
     box.classList.add("mh-float");
+    box.style.display = "none";   // 初始收起（.mh-chat 的 display:flex 会覆盖 .mh-float 的 display:none）
     var fab = el("button", "mh-fab", "✉");
     fab.type = "button";
     fab.title = cfg.title || "在线咨询";

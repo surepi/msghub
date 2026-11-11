@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import os
 import secrets
 import time
 import urllib.request
@@ -20,6 +21,21 @@ from .db import STATUSES, get_db, init_db, rows
 STATIC = Path(__file__).parent / "static"
 
 app = FastAPI(title="MsgHub 留言汇", version="0.1.0", docs_url="/api/docs", redoc_url=None)
+
+
+@app.middleware("http")
+async def cache_headers(request: Request, call_next):
+    """页面和脚本每次都向服务器确认是否更新（未变化时返回 304），避免 CDN / 浏览器在部署后继续用旧版本；
+    上传的图片文件名随机且内容不变，长期缓存。"""
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/uploads/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif path == "/" or path == "/embed.js" or path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 app.mount("/uploads", StaticFiles(directory=media.UPLOAD_DIR), name="uploads")
 app.include_router(chat.router)
@@ -40,14 +56,23 @@ def health():
     return {"ok": True}
 
 
+def _file(request: Request, path: Path, media_type: str | None = None) -> Response:
+    """带 ETag 的文件响应；浏览器带着相同 ETag 来确认时返回 304，不重复传输内容。"""
+    resp = FileResponse(path, media_type=media_type, stat_result=os.stat(path))
+    etag = resp.headers.get("etag")
+    if etag and request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"etag": etag})
+    return resp
+
+
 @app.get("/", include_in_schema=False)
-def index():
-    return FileResponse(STATIC / "index.html")
+def index(request: Request):
+    return _file(request, STATIC / "index.html")
 
 
 @app.get("/embed.js", include_in_schema=False)
-def embed_js():
-    return FileResponse(STATIC / "embed.js", media_type="application/javascript")
+def embed_js(request: Request):
+    return _file(request, STATIC / "embed.js", "application/javascript")
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +149,7 @@ async def public_submit(request: Request, bg: BackgroundTasks):
     if not site or not site["enabled"]:
         return fail(403, "站点不存在或已停用")
     site = dict(site)
-    if not origin_allowed(site, origin):
+    if not origin_allowed(site, origin, request.headers):
         return fail(403, "来源域名不被允许")
 
     redirect = s("_redirect")

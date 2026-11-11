@@ -73,9 +73,15 @@ class RateLimiter:
             return True
 
 
-def origin_allowed(site: dict, origin: str) -> bool:
-    """站点配置了允许来源时，校验请求的 Origin；没配置或请求没带 Origin 则放行。"""
+def origin_allowed(site: dict, origin: str, headers=None) -> bool:
+    """站点配置了允许来源时，校验请求的 Origin；没配置或请求没带 Origin 则放行。
+    MsgHub 自己的页面（如后台的挂件预览页）始终放行：传入 headers 时比较 Origin 与 Host。"""
     allowed = [o.strip().rstrip("/") for o in site["allowed_origins"].split(",") if o.strip()]
     if not allowed or not origin:
         return True
-    return origin.rstrip("/") in allowed
+    if origin.rstrip("/") in allowed:
+        return True
+    if headers is not None:
+        host = origin.split("://", 1)[-1].rstrip("/")
+        return host in {headers.get("host", ""), headers.get("x-forwarded-host", "")}
+    return False

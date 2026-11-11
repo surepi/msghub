@@ -113,6 +113,7 @@
           ${s.enabled ? '<span class="tag handled">启用</span>' : '<span class="tag spam">停用</span>'}
           <span class="muted">共 ${s.total} 条 · 未读 ${s.unread}</span>
           <span class="spacer"></span>
+          <button class="btn sm" data-act="preview">预览挂件</button>
           <button class="btn sm" data-act="view">查看留言</button>
           <button class="btn sm" data-act="edit">编辑</button>
           <button class="btn sm" data-act="rotate">重置 Key</button>
@@ -136,6 +137,7 @@
     const act = btn.dataset.act;
     try {
       if (act === "copy") { await navigator.clipboard.writeText(s.site_key); toast("已复制"); }
+      if (act === "preview") window.open(`/static/preview.html?site=${id}`, "_blank", "noopener");
       if (act === "view") { $("#fSite").value = id; location.hash = "#messages"; state.page = 1; loadMessages(); }
       if (act === "edit") openSite(s);
       if (act === "rotate" && confirm("重置后旧 Key 立即失效，网站上的接入代码需要同步更新。确定？")) {

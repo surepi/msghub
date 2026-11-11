@@ -84,7 +84,7 @@ async def visitor_upload(request: Request, file: UploadFile, site_key: str = For
     with get_db() as db:
         site = db.execute("SELECT * FROM sites WHERE site_key = ?", (site_key,)).fetchone()
         visitor = db.execute("SELECT id FROM visitors WHERE token = ?", (token,)).fetchone()
-    if not site or not site["enabled"] or not origin_allowed(dict(site), origin):
+    if not site or not site["enabled"] or not origin_allowed(dict(site), origin, request.headers):
         return reply(403, {"error": "站点不存在或来源不被允许"})
     if not visitor:
         return reply(403, {"error": "请先开始对话"})

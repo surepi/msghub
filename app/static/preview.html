@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>挂件预览 · MsgHub</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.7 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: #1f2937; background: #fff; }
+  .bar { background: #111827; color: #e5e7eb; padding: 10px 16px; font-size: 13px; display: flex; gap: 12px;
+    align-items: center; flex-wrap: wrap; }
+  .bar b { color: #fff; }
+  .bar .sp { flex: 1; }
+  .bar button, .bar a { font: inherit; color: #e5e7eb; background: #374151; border: 0; border-radius: 6px;
+    padding: 4px 10px; cursor: pointer; text-decoration: none; }
+  .bar button:hover, .bar a:hover { background: #4b5563; }
+  .warn { background: #fef3c7; color: #92400e; padding: 8px 16px; font-size: 13px; }
+  header.site { display: flex; align-items: center; gap: 24px; padding: 18px 16px; max-width: 1040px; margin: 0 auto; }
+  header.site .logo { font-weight: 700; font-size: 20px; }
+  header.site nav { display: flex; gap: 18px; color: #6b7280; font-size: 14px; }
+  .hero { background: linear-gradient(135deg, #eef2ff, #f0f9ff); padding: 64px 16px; }
+  .hero div { max-width: 1040px; margin: 0 auto; }
+  .hero h1 { margin: 0 0 12px; font-size: 34px; line-height: 1.3; }
+  .hero p { margin: 0; color: #4b5563; max-width: 560px; }
+  main { max-width: 1040px; margin: 0 auto; padding: 40px 16px 120px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+  .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 18px; }
+  .card h3 { margin: 0 0 6px; font-size: 16px; }
+  .card p { margin: 0; color: #6b7280; font-size: 14px; }
+  .code { margin-top: 40px; }
+  .code h2 { font-size: 18px; margin: 0 0 8px; }
+  pre { background: #f3f4f6; border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 13px; margin: 0; }
+  .msg { max-width: 560px; margin: 80px auto; text-align: center; color: #4b5563; padding: 0 16px; }
+  @media (max-width: 600px) { header.site nav { display: none; } .hero h1 { font-size: 26px; } }
+</style>
+</head>
+<body>
+<div id="root"><div class="msg">加载中…</div></div>
+<script>
+(function () {
+  "use strict";
+  const root = document.getElementById("root");
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  let token = "";
+  try { token = localStorage.getItem("msghub_token") || ""; } catch (_) {}
+  const siteId = +new URLSearchParams(location.search).get("site");
+
+  function fail(html) { root.innerHTML = `<div class="msg">${html}</div>`; }
+  if (!token) return fail('请先 <a href="/">登录 MsgHub 后台</a>，再从「站点」页点击“预览挂件”。');
+
+  fetch("/api/admin/sites", { headers: { Authorization: "Bearer " + token } })
+    .then((r) => { if (r.status === 401) throw new Error("login"); return r.json(); })
+    .then((sites) => {
+      const site = sites.find((s) => s.id === siteId);
+      if (!site) return fail('站点不存在。<a href="/#sites">返回后台</a>');
+      render(site);
+    })
+    .catch((e) => fail(e.message === "login" ? '登录已过期，请 <a href="/">重新登录</a>。' : "加载失败：" + esc(e.message)));
+
+  function render(site) {
+    document.title = `挂件预览 · ${site.name}`;
+    const snippet = `<script src="${location.origin}/embed.js" data-site-key="${site.site_key}"><\/script>`;
+    root.innerHTML = `
+      <div class="bar">
+        <span><b>挂件预览</b> · 站点「${esc(site.name)}」· 下面是一个示例网页，右下角就是访客看到的咨询按钮</span>
+        <span class="sp"></span>
+        <button id="fresh" title="清除本页保存的访客身份，重新体验填写资料">以新访客身份重新开始</button>
+        <a href="/#sites">返回后台</a>
+      </div>
+      ${site.enabled ? "" : '<div class="warn">该站点当前已停用，挂件会显示“在线客服暂不可用”。</div>'}
+      <div class="warn">在这里发出的消息是真实对话：会出现在后台「对话」中，并转发给客服 QQ。</div>
+      <header class="site"><span class="logo">示例公司</span><nav><span>首页</span><span>产品</span><span>价格</span><span>关于我们</span></nav></header>
+      <section class="hero"><div><h1>让客户随时找到你</h1>
+        <p>这是一段示例文字。真实接入时，挂件会出现在你自己网站的每个页面上，样式与这里一致。</p></div></section>
+      <main>
+        <div class="cards">
+          <div class="card"><h3>产品介绍</h3><p>示例内容，用来模拟一个普通的网站页面。</p></div>
+          <div class="card"><h3>价格方案</h3><p>示例内容，访客可以随时点右下角按钮咨询。</p></div>
+          <div class="card"><h3>售后服务</h3><p>示例内容，非工作时间的咨询会按站点设置处理。</p></div>
+        </div>
+        <div class="code"><h2>接入代码</h2><pre>${esc(snippet)}</pre></div>
+      </main>`;
+    document.getElementById("fresh").onclick = () => {
+      try { localStorage.removeItem("msghub:" + site.site_key); } catch (_) {}
+      location.reload();
+    };
+    const s = document.createElement("script");
+    s.src = "/embed.js";
+    s.setAttribute("data-site-key", site.site_key);
+    s.setAttribute("data-title", "在线咨询");
+    document.body.appendChild(s);
+  }
+})();
+</script>
+</body>
+</html>

@@ -310,7 +310,7 @@ async def visitor_ws(ws: WebSocket):
     site = find_site(str(hello.get("site_key", "")))
     if not site or not site["enabled"]:
         return await fail("站点不存在或已停用", 4403)
-    if not origin_allowed(site, ws.headers.get("origin", "")):
+    if not origin_allowed(site, ws.headers.get("origin", ""), ws.headers):
         return await fail("来源域名不被允许", 4403)
 
     ip = ws.client.host if ws.client else ""
