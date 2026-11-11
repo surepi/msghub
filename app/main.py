@@ -12,8 +12,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import auth, chat, qq
-from .common import RateLimiter, origin_allowed
+from . import auth, auto, chat, media, qq
+from .common import RateLimiter, origin_allowed, parse_work_hours
 from .config import MAX_CONTACT, MAX_CONTENT, MAX_NAME, RATE_LIMIT_PER_MIN
 from .db import STATUSES, get_db, init_db, rows
 
@@ -21,14 +21,18 @@ STATIC = Path(__file__).parent / "static"
 
 app = FastAPI(title="MsgHub 留言汇", version="0.1.0", docs_url="/api/docs", redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+app.mount("/uploads", StaticFiles(directory=media.UPLOAD_DIR), name="uploads")
 app.include_router(chat.router)
+app.include_router(media.router)
 app.include_router(qq.router)
+app.include_router(auto.router)
 
 
 @app.on_event("startup")
 async def _startup():
     init_db()
-    qq.setup()
+    qq.setup()     # 先注册 QQ 转发，再注册 AI / 转留言
+    auto.setup()
 
 
 @app.get("/api/health")
@@ -215,6 +219,30 @@ class SiteIn(BaseModel):
     allowed_origins: str = ""
     webhook_url: str = ""
     enabled: bool = True
+    welcome: str = ""
+    offline_text: str = ""
+    work_hours: dict | None = None     # {"days":[1..7],"start":"09:00","end":"18:00"}；None = 全天
+    require_contact: bool = True
+    ai_enabled: bool = True
+    crawl_urls: str = ""
+
+
+SITE_FIELDS = ("name", "domain", "allowed_origins", "webhook_url", "enabled", "welcome", "offline_text",
+               "work_hours", "require_contact", "ai_enabled", "crawl_urls")
+
+
+def _site_values(body: SiteIn) -> list:
+    if not body.name.strip():
+        raise HTTPException(400, "站点名称不能为空")
+    wh = ""
+    if body.work_hours:
+        wh = json.dumps(body.work_hours, ensure_ascii=False)
+        if not parse_work_hours(wh) or not parse_work_hours(wh)["days"]:
+            raise HTTPException(400, "工作时间格式不正确：至少选一天，时间为 HH:MM")
+        wh = json.dumps(parse_work_hours(wh), ensure_ascii=False)
+    return [body.name.strip(), body.domain.strip(), body.allowed_origins.strip(), body.webhook_url.strip(),
+            int(body.enabled), body.welcome.strip()[:500], body.offline_text.strip()[:500], wh,
+            int(body.require_contact), int(body.ai_enabled), body.crawl_urls.strip()[:2000]]
 
 
 @app.get("/api/admin/sites", tags=["站点"], dependencies=[admin])
@@ -230,23 +258,23 @@ def list_sites():
 
 @app.post("/api/admin/sites", tags=["站点"], dependencies=[admin])
 def create_site(body: SiteIn):
-    if not body.name.strip():
-        raise HTTPException(400, "站点名称不能为空")
+    values = _site_values(body)
     key = "sk_" + secrets.token_urlsafe(24)
     with get_db() as db:
         cur = db.execute(
-            "INSERT INTO sites (name,domain,site_key,allowed_origins,webhook_url,enabled) VALUES (?,?,?,?,?,?)",
-            (body.name.strip(), body.domain.strip(), key, body.allowed_origins.strip(), body.webhook_url.strip(), int(body.enabled)),
+            f"INSERT INTO sites (site_key, {', '.join(SITE_FIELDS)}) VALUES (?{', ?' * len(SITE_FIELDS)})",
+            [key, *values],
         )
         return dict(db.execute("SELECT * FROM sites WHERE id = ?", (cur.lastrowid,)).fetchone())
 
 
 @app.put("/api/admin/sites/{site_id}", tags=["站点"], dependencies=[admin])
 def update_site(site_id: int, body: SiteIn):
+    values = _site_values(body)
     with get_db() as db:
         cur = db.execute(
-            "UPDATE sites SET name=?, domain=?, allowed_origins=?, webhook_url=?, enabled=? WHERE id=?",
-            (body.name.strip(), body.domain.strip(), body.allowed_origins.strip(), body.webhook_url.strip(), int(body.enabled), site_id),
+            f"UPDATE sites SET {', '.join(f + '=?' for f in SITE_FIELDS)} WHERE id=?",
+            [*values, site_id],
         )
         if not cur.rowcount:
             raise HTTPException(404, "站点不存在")

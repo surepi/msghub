@@ -11,6 +11,7 @@
 客服回复定位会话的顺序：引用的消息 → 「#编号 内容」→ 当前默认会话（最近转发过来的会话）。
 """
 import asyncio
+import base64
 import json
 import re
 import secrets
@@ -23,7 +24,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import auth, chat
+from . import auth, auto, chat, media
 from .config import (QQ_API_BASE, QQ_APP_ID, QQ_APP_SECRET, QQ_MERGE_DELAY, QQ_PASSIVE_MAX, QQ_PASSIVE_WINDOW,
                      QQ_TOKEN_URL)
 from .db import get_db, rows
@@ -149,12 +150,22 @@ class QQClient:
             return d
         raise QQApiError(None, "鉴权失败", 401)
 
-    async def send_c2c(self, openid: str, content: str, msg_id: str = "", msg_seq: int = 0) -> dict:
-        body: dict = {"content": content, "msg_type": 0}
+    async def send_c2c(self, openid: str, content: str = "", msg_id: str = "", msg_seq: int = 0,
+                       body: dict | None = None) -> dict:
+        """发送单聊消息。body 为空时发文字；传 body 可发富媒体（msg_type=7）。"""
+        body = dict(body) if body else {"content": content, "msg_type": 0}
         if msg_id:
             body["msg_id"] = msg_id
             body["msg_seq"] = msg_seq
         return await self.call("POST", f"/v2/users/{openid}/messages", body)
+
+    async def upload_image(self, openid: str, data: bytes) -> str:
+        """上传图片（二进制，≤5MB），返回发送消息时用的 file_info。"""
+        d = await self.call("POST", f"/v2/users/{openid}/files", {
+            "file_type": 1, "file_data": base64.b64encode(data).decode(), "srv_send_msg": False})
+        if not d.get("file_info"):
+            raise QQApiError(d.get("code"), d.get("message") or "上传图片失败")
+        return d["file_info"]
 
 
 client = QQClient()
@@ -187,40 +198,75 @@ def _chunks(text: str) -> list[str]:
     return [text[i:i + MAX_QQ_TEXT] for i in range(0, len(text), MAX_QQ_TEXT)] or [""]
 
 
-async def deliver(text: str, conv_id: int | None = None, openid: str = "") -> tuple[list[str], str]:
-    """发给客服。返回 (成功发出的 QQ 消息 ID 列表, 失败原因)。发出的消息记入 qq_forwards 供引用回复定位。"""
-    async with _send_lock:
+async def _send_one(openid: str, body: dict, conv_id: int | None) -> str:
+    """发一条消息给客服：主动消息失败时用被动回复兜底。成功返回消息 ID，失败抛 QQApiError。
+    调用方需持有 _send_lock。"""
+    try:
+        d = await client.send_c2c(openid, body=body)
+    except QQApiError as e:
         a = agent()
-        openid = openid or a["openid"]
+        if not passive_available(a) or openid != a["openid"]:
+            log(f"主动消息失败且无可用被动窗口：{e}")
+            raise
+        seq = a["passive_used"] + 1
+        update_agent(passive_used=seq)
+        try:
+            d = await client.send_c2c(openid, body=body, msg_id=a["last_msg_id"], msg_seq=seq)
+        except QQApiError as e2:
+            log(f"主动消息失败（{e}），被动回复也失败：{e2}")
+            raise
+    refs = [d.get("id"), (d.get("ext_info") or {}).get("ref_idx")]
+    if conv_id:
+        with get_db() as db:
+            for ref in filter(None, refs):
+                db.execute("INSERT OR REPLACE INTO qq_forwards (qq_msg_id, conversation_id) VALUES (?, ?)",
+                           (str(ref), conv_id))
+    return str(d.get("id") or "sent")
+
+
+async def deliver(text: str, conv_id: int | None = None, openid: str = "") -> tuple[list[str], str]:
+    """发文字给客服。返回 (成功发出的 QQ 消息 ID 列表, 失败原因)。发出的消息记入 qq_forwards 供引用回复定位。"""
+    async with _send_lock:
+        openid = openid or agent()["openid"]
         if not openid:
             return [], "尚未绑定客服"
         ids: list[str] = []
         for part in _chunks(text):
             try:
-                d = await client.send_c2c(openid, part)
+                ids.append(await _send_one(openid, {"content": part, "msg_type": 0}, conv_id))
             except QQApiError as e:
-                a = agent()
-                if not passive_available(a) or openid != a["openid"]:
-                    log(f"主动消息失败且无可用被动窗口：{e}")
-                    return ids, f"发送失败：{e.message}（{e.code}）"
-                seq = a["passive_used"] + 1
-                update_agent(passive_used=seq)
-                try:
-                    d = await client.send_c2c(openid, part, a["last_msg_id"], seq)
-                except QQApiError as e2:
-                    log(f"主动消息失败（{e}），被动回复也失败：{e2}")
-                    return ids, f"发送失败：{e2.message}（{e2.code}）"
+                return ids, f"发送失败：{e.message}（{e.code}）"
             except Exception as e:  # noqa: BLE001  网络错误
                 log(f"发送异常：{e}")
                 return ids, f"网络错误：{e}"
-            refs = [d.get("id"), (d.get("ext_info") or {}).get("ref_idx")]
-            if conv_id:
-                with get_db() as db:
-                    for ref in filter(None, refs):
-                        db.execute("INSERT OR REPLACE INTO qq_forwards (qq_msg_id, conversation_id) VALUES (?, ?)",
-                                   (str(ref), conv_id))
-            ids.append(str(d.get("id") or ""))
         return ids, ""
+
+
+async def deliver_image(path: str, conv_id: int | None = None) -> tuple[str, str]:
+    """把站内图片发给客服。QQ 只支持 png/jpg，其他格式返回失败原因由调用方改发文字提示。"""
+    local = media.local_path(path)
+    if not local:
+        return "", "图片不存在"
+    if local.suffix.lower() not in (".png", ".jpg"):
+        return "", f"QQ 不支持 {local.suffix[1:].upper()} 格式"
+    async with _send_lock:
+        openid = agent()["openid"]
+        if not openid:
+            return "", "尚未绑定客服"
+        try:
+            file_info = await client.upload_image(openid, local.read_bytes())
+            return await _send_one(openid, {"msg_type": 7, "media": {"file_info": file_info}}, conv_id), ""
+        except QQApiError as e:
+            return "", f"发送图片失败：{e.message}（{e.code}）"
+        except Exception as e:  # noqa: BLE001
+            log(f"发送图片异常：{e!r}")
+            return "", f"网络错误：{e}"
+
+
+async def notify(text: str, conv_id: int | None = None):
+    """给客服发提醒（AI 回复、转人工等）；未绑定时忽略。"""
+    if agent()["openid"]:
+        await deliver(text, conv_id)
 
 
 async def reply_to(openid: str, msg_id: str, text: str):
@@ -258,8 +304,11 @@ async def on_visitor_message(conv: dict, msg: dict):
 
 
 def compose(conv: dict, msgs: list[dict], first: bool) -> str:
-    head = f"【{conv['site_name']}】#{conv['id']} {conv['visitor_name'] or '访客'}"
-    body = "\n".join(m["content"] for m in msgs)
+    who = conv["visitor_name"] or "访客"
+    if conv.get("visitor_contact"):
+        who += f"（{conv['visitor_contact']}）"
+    head = f"【{conv['site_name']}】#{conv['id']} {who}"
+    body = "\n".join("[图片，见下一条]" if m["msg_type"] == "image" else m["content"] for m in msgs)
     if first:
         return (f"{head}（新会话）\n页面：{conv['page_url'] or '—'}\n——\n{body}\n——\n"
                 f"引用本条回复，或发「#{conv['id']} 内容」")
@@ -274,8 +323,8 @@ async def flush_conversation(conv_id: int) -> bool:
         return True
     with get_db() as db:
         msgs = rows(db.execute(
-            "SELECT id, content FROM chat_messages WHERE conversation_id = ? AND qq_state = 'pending' ORDER BY id",
-            (conv_id,)))
+            "SELECT id, content, msg_type FROM chat_messages WHERE conversation_id = ? AND qq_state = 'pending' "
+            "ORDER BY id", (conv_id,)))
         first = not db.execute(
             "SELECT 1 FROM chat_messages WHERE conversation_id = ? AND qq_state = 'sent' LIMIT 1", (conv_id,)
         ).fetchone()
@@ -288,6 +337,12 @@ async def flush_conversation(conv_id: int) -> bool:
     with get_db() as db:
         db.executemany("UPDATE chat_messages SET qq_state = 'sent', qq_message_id = ? WHERE id = ?",
                        [(ids[0], m["id"]) for m in msgs])
+    # 图片紧跟在文字后面单独发；发不了的（格式不支持等）给客服一句提示，图片可在网页后台查看
+    for m in msgs:
+        if m["msg_type"] == "image":
+            _, err = await deliver_image(m["content"], conv_id)
+            if err:
+                await deliver(f"#{conv_id} 的图片无法转发（{err}），请在网页后台查看", conv_id)
     a = agent()
     if a["current_conv_id"] != conv_id:
         update_agent(current_conv_id=conv_id, current_set_at=time.time())
@@ -362,6 +417,20 @@ async def handle_command(content: str, a: dict):
     return await say("未知指令。\n\n" + HELP)
 
 
+def _download(url: str) -> bytes:
+    """下载客服在 QQ 里发的图片（平台地址会过期，所以存到本地）。"""
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 MsgHub"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = r.read(media.MAX_IMAGE_BYTES + 1)
+    if len(data) > media.MAX_IMAGE_BYTES:
+        raise ValueError("图片超过 5MB")
+    return data
+
+
 def quoted_refs(d: dict) -> list[str]:
     """取出客服"引用回复"时被引用消息的编号。平台在不同位置给出：
     message_reference.message_id；message_scene.ext 中的 ref_msg_idx=...；msg_elements 中被引用消息的 msg_idx。"""
@@ -418,11 +487,13 @@ async def handle_c2c(d: dict):
     a = agent()
     await flush_backlog()  # 客服刚发过消息，被动窗口打开，先补发积压
 
-    if not content:
-        if d.get("attachments"):
-            await deliver("暂不支持把图片 / 文件转给访客，请发送文字。")
+    attachments = [x for x in (d.get("attachments") or []) if isinstance(x, dict)]
+    images = [x for x in attachments if str(x.get("content_type", "")).startswith("image")]
+    if len(images) < len(attachments):
+        await deliver("暂不支持把文件 / 语音 / 视频转给访客，请发送文字或图片。")
+    if not content and not images:
         return
-    if content.startswith("/"):
+    if content.startswith("/") and not images:
         await handle_command(content, a)
         return
 
@@ -436,9 +507,13 @@ async def handle_c2c(d: dict):
                            refs).fetchone()
         target = r[0] if r else None
         log(f"引用回复 → {'#' + str(target) if target else '未找到对应会话'}（候选 {[x[:24] for x in refs]}）")
-    m = re.match(r"^#(\d+)\s+(.+)$", content, re.S)
+    m = re.match(r"^#(\d+)(?:\s+(.*))?$", content, re.S)
+    if m and not (m.group(2) or "").strip() and not images:
+        if len(images) == len(attachments):   # 没有附件（有不支持的附件时上面已提示过）
+            await deliver(f"请在 #{m.group(1)} 后面写上要回复的内容")
+        return
     if m:
-        target, text = int(m.group(1)), m.group(2).strip()
+        target, text = int(m.group(1)), (m.group(2) or "").strip()
     if not target:
         implicit = True
         target = a["current_conv_id"]
@@ -453,7 +528,17 @@ async def handle_c2c(d: dict):
         await deliver(f"会话 #{target} 不存在")
         return
 
-    await chat.agent_reply(target, text)
+    for img in images:
+        try:
+            data = await asyncio.to_thread(_download, str(img.get("url") or ""))
+            path = media.save_image(data)
+        except Exception as e:  # noqa: BLE001
+            log(f"下载客服图片失败：{e!r}")
+            await deliver(f"图片没能发给 #{target}：{e}")
+            continue
+        await chat.agent_reply(target, path, "image")
+    if text:
+        await chat.agent_reply(target, text)
     if implicit:
         await deliver(f"✓ 已发给 #{target}")
     elif target != a["current_conv_id"]:
@@ -601,5 +686,8 @@ def setup():
         log("未配置 QQ_APP_ID / QQ_APP_SECRET，QQ 转发未启用")
         return
     chat.visitor_message_hooks.append(on_visitor_message)
+    # 客服在 QQ 发 /忙 后视为不在岗：访客看到离线提示，消息交给 AI / 转留言
+    chat.agent_available = lambda: (lambda a: not a["openid"] or bool(a["online"]))(agent())
+    auto.notify_agent = notify
     _spawn(_backlog_loop())
     log(f"已启用，AppID {QQ_APP_ID}")

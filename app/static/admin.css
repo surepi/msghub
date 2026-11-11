@@ -154,3 +154,32 @@ details[open] summary { margin-bottom: 8px; }
 .qq-card h3 { margin: 0; font-size: 16px; }
 .qq-card p { margin: 8px 0 0; }
 .bind-code { font-size: 22px; letter-spacing: 4px; font-variant-numeric: tabular-nums; }
+
+/* ---------- 第三阶段：图片、AI、站点设置 ---------- */
+.msg { flex-direction: column; align-items: flex-start; }
+.msg.agent { align-items: flex-end; }
+.msg.system { align-items: center; }
+.msg.ai .bub { background: #f5f3ff; border-color: #ddd6fe; color: #1f2937; }
+.msg .who { font-size: 11px; color: var(--muted); margin: 0 4px 2px; }
+.bub.img { padding: 4px; background: var(--card) !important; border-color: var(--line) !important; color: var(--text) !important; }
+.bub img { display: block; max-width: 260px; max-height: 260px; border-radius: 6px; }
+.btn.icon { padding: 0; width: 40px; height: 40px; font-size: 18px; flex: none; }
+.form-sec { margin: 8px 0 0; padding-top: 12px; border-top: 1px solid var(--line); font-size: 14px; }
+.wh { display: grid; gap: 8px; }
+.wh-days { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.wh-time { display: flex; align-items: center; gap: 8px; }
+.ai-card { padding: 16px; display: grid; gap: 12px; margin-bottom: 16px; }
+.ai-card h3 { margin: 0; font-size: 16px; }
+.ai-card p { margin: 0; }
+.ai-card label { display: grid; gap: 4px; }
+.ai-card label.row { display: flex; align-items: center; gap: 8px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.ai-test { display: flex; gap: 8px; flex-wrap: wrap; }
+.ai-test input { flex: 1; min-width: 200px; }
+.ai-out { background: var(--bg); border-radius: 8px; padding: 12px; white-space: pre-wrap; }
+.ai-out pre { white-space: pre-wrap; max-height: 240px; overflow: auto; }
+.qa { border-top: 1px solid var(--line); padding: 10px 0; display: grid; gap: 4px; }
+.qa-q { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.qa-a { white-space: pre-wrap; color: var(--muted); font-size: 13px; }
+.kb-pages { margin: 8px 0 0; padding-left: 18px; font-size: 13px; }
+@media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }

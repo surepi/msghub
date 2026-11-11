@@ -27,6 +27,7 @@
       <a href="#chats" data-view="chats">对话 <span id="navUnread" class="nav-badge hidden"></span></a>
       <a href="#messages" data-view="messages">留言</a>
       <a href="#sites" data-view="sites">站点</a>
+      <a href="#ai" data-view="ai">AI</a>
     </nav>
     <button class="btn ghost" id="logout">退出</button>
   </header>
@@ -90,6 +91,44 @@
       <div class="pager" id="pager"></div>
     </section>
 
+    <!-- AI -->
+    <section id="view-ai" class="view hidden">
+      <form id="aiForm" class="card ai-card">
+        <div class="site-head"><h3>AI 自动应答</h3><span id="aiState"></span></div>
+        <p class="muted">客服不在线、非工作时间，或超过设定时间没回复时，由 AI 根据问答库和网站内容先回答；答不了的转为留言。
+          AI 的回复会同步发给客服 QQ，客服回复后 AI 自动退出。</p>
+        <label class="row"><input type="checkbox" name="enabled"> 开启 AI 自动应答</label>
+        <div class="grid2">
+          <label>接口地址（兼容 OpenAI）<input name="base_url" placeholder="https://api.deepseek.com/v1"></label>
+          <label>模型名称<input name="model" placeholder="deepseek-chat"></label>
+          <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder="不修改请留空"></label>
+          <label>无人回复多久后由 AI / 转留言（分钟）<input name="no_reply_minutes" type="number" min="1" max="120" value="3"></label>
+        </div>
+        <label>额外要求（可选）<textarea name="prompt" rows="2" maxlength="2000" placeholder="例如：称呼访客为“您”；涉及报价时提醒以客服确认为准"></textarea></label>
+        <div class="actions"><button class="btn primary" type="submit">保存设置</button></div>
+        <div class="ai-test">
+          <select id="aiTestSite"></select>
+          <input id="aiTestQ" placeholder="输入一个访客可能会问的问题，测试 AI 怎么回答">
+          <button class="btn" type="button" id="aiTestBtn">测试</button>
+        </div>
+        <div id="aiTestOut" class="ai-out hidden"></div>
+      </form>
+
+      <div class="card ai-card">
+        <div class="site-head"><h3>问答库</h3><span class="spacer"></span>
+          <select id="qaSite"></select>
+          <button class="btn sm primary" id="qaNew" type="button">+ 添加问答</button></div>
+        <p class="muted">AI 优先参考这里的标准答案。“所有站点”的问答对每个站点都生效。</p>
+        <div id="qaList"></div>
+      </div>
+
+      <div class="card ai-card">
+        <div class="site-head"><h3>网站内容</h3><span class="spacer"></span><select id="kbSite"></select></div>
+        <p class="muted">定期抓取站点网页（同域名，最多 50 页，遵守 robots.txt，每天自动更新），作为 AI 的补充资料。</p>
+        <div id="kbBox"></div>
+      </div>
+    </section>
+
     <!-- 站点 -->
     <section id="view-sites" class="view hidden">
       <div id="qqCard" class="card qq-card"></div>
@@ -125,6 +164,45 @@
       <input name="webhook_url" placeholder="https://… （有新留言时 POST JSON）">
     </label>
     <label class="row"><input type="checkbox" name="enabled" checked> 启用</label>
+
+    <h4 class="form-sec">在线对话</h4>
+    <label>欢迎语<input name="welcome" placeholder="您好，请问有什么可以帮您？" maxlength="500"></label>
+    <label class="row"><input type="checkbox" name="require_contact" checked> 对话前必须填写称呼和联系方式</label>
+    <div class="wh">
+      <label class="row"><input type="checkbox" name="wh_all"> 全天在线（不限工作时间）</label>
+      <div class="wh-detail">
+        <div class="wh-days">
+          <label class="row"><input type="checkbox" name="wh_day" value="1">一</label>
+          <label class="row"><input type="checkbox" name="wh_day" value="2">二</label>
+          <label class="row"><input type="checkbox" name="wh_day" value="3">三</label>
+          <label class="row"><input type="checkbox" name="wh_day" value="4">四</label>
+          <label class="row"><input type="checkbox" name="wh_day" value="5">五</label>
+          <label class="row"><input type="checkbox" name="wh_day" value="6">六</label>
+          <label class="row"><input type="checkbox" name="wh_day" value="7">日</label>
+        </div>
+        <div class="wh-time"><input type="time" name="wh_start" value="09:00"> 至 <input type="time" name="wh_end" value="18:00"></div>
+      </div>
+    </div>
+    <label>非工作时间提示语
+      <textarea name="offline_text" rows="2" maxlength="500" placeholder="客服当前不在线，您可以先留言，我们上班后会尽快通过您留下的联系方式联系您。"></textarea>
+    </label>
+
+    <h4 class="form-sec">AI 自动应答</h4>
+    <label class="row"><input type="checkbox" name="ai_enabled" checked> 该站点使用 AI 自动应答（需先在「AI」页开启）</label>
+    <label>网站内容抓取起始地址
+      <textarea name="crawl_urls" rows="2" placeholder="每行一个，如 https://example.com/&#10;留空则抓取上面填写的域名首页"></textarea>
+    </label>
+    <button class="btn primary" type="submit">保存</button>
+  </form>
+</div>
+
+<!-- 问答编辑 -->
+<div id="qaModal" class="drawer hidden">
+  <form class="drawer-panel card" id="qaForm">
+    <div class="drawer-head"><h3 id="qaModalTitle">添加问答</h3><button type="button" class="btn ghost" data-close>✕</button></div>
+    <label>适用站点<select name="site_id"></select></label>
+    <label>问题 *<input name="question" required maxlength="500" placeholder="例如：你们的价格是多少？"></label>
+    <label>答案 *<textarea name="answer" required rows="6" maxlength="3000"></textarea></label>
     <button class="btn primary" type="submit">保存</button>
   </form>
 </div>

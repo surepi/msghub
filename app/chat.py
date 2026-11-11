@@ -3,12 +3,17 @@
 协议（JSON 文本帧）
 访客 → 服务端
     {"type":"hello", "site_key":"sk_..", "token":"<可空>", "page_url":".."}   连接后 10 秒内必须发送
-    {"type":"msg", "content":"..", "client_id":"<可选，用于去重回显>", "page_url":".."}
+    {"type":"profile", "name":"..", "contact":".."}                          填写称呼和联系方式
+    {"type":"msg", "content":"..", "msg_type":"text|image", "client_id":"..", "page_url":".."}
+        msg_type=image 时 content 为 /api/chat/upload 返回的图片路径
     {"type":"ping"}
 服务端 → 访客
-    {"type":"init", "conversation":{id,status}|null, "messages":[...]}
-    {"type":"token", "token":".."}                  首次发消息时下发访客身份，浏览器自行保存
-    {"type":"msg", "message":{...}, "client_id":".."}
+    {"type":"init", "site":{welcome, require_contact, online, offline_text},
+                    "profile":{name, contact}|null, "conversation":{id,status}|null, "messages":[...]}
+    {"type":"token", "token":".."}                  首次创建访客身份时下发，浏览器自行保存
+    {"type":"profile_ok", "profile":{...}}
+    {"type":"msg", "message":{id, sender, msg_type, content, created_at}, "client_id":".."}
+        sender: visitor / agent / ai / system
     {"type":"status", "status":"waiting|active|closed"}
     {"type":"error", "error":".."}  /  {"type":"pong"}
 
@@ -26,9 +31,10 @@ from typing import Awaitable, Callable
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from . import auth
-from .common import RateLimiter, origin_allowed
-from .config import MAX_CONTENT
+from . import auth, media
+from .common import (DEFAULT_OFFLINE, DEFAULT_WELCOME, RateLimiter, in_work_hours, origin_allowed,
+                     valid_contact)
+from .config import MAX_CONTACT, MAX_CONTENT, MAX_NAME
 from .db import get_db, rows
 
 router = APIRouter()
@@ -36,6 +42,7 @@ admin = Depends(auth.require_admin)
 
 HELLO_TIMEOUT = 10
 HISTORY_LIMIT = 100
+SENDERS = ("visitor", "agent", "ai", "system")
 
 _msg_by_visitor = RateLimiter(20)      # 每个访客每分钟最多 20 条
 _msg_by_ip = RateLimiter(60)           # 每个 IP 每分钟最多 60 条
@@ -90,10 +97,27 @@ class Hub:
 
 hub = Hub()
 
-# 访客发来新消息后依次调用 hook(conversation, message)。
-# 第 ② 阶段在这里接入 QQ 转发；hook 抛出的异常只记录，不影响访客。
+# 访客发来新消息后依次调用 hook(conversation, message)；hook 抛出的异常只记录，不影响访客。
+# 注册方：qq（转发给客服）、auto（AI 应答 / 转留言）。
 VisitorHook = Callable[[dict, dict], Awaitable[None]]
 visitor_message_hooks: list[VisitorHook] = []
+
+# 客服是否在岗（不考虑工作时间）。接入 QQ 后由 qq 模块替换为"客服未设为忙碌"。
+agent_available: Callable[[], bool] = lambda: True
+
+
+def site_online(site: dict) -> bool:
+    """该站点此刻是否有人工客服：在工作时间内，且客服没有设为忙碌。"""
+    return in_work_hours(site.get("work_hours", "")) and agent_available()
+
+
+def site_public_config(site: dict) -> dict:
+    return {
+        "welcome": site.get("welcome") or DEFAULT_WELCOME,
+        "offline_text": site.get("offline_text") or DEFAULT_OFFLINE,
+        "require_contact": bool(site.get("require_contact", 1)),
+        "online": site_online(site),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +131,12 @@ CONV_SUMMARY_SQL = (
 
 
 def _msg_out(m: dict) -> dict:
-    return {"id": m["id"], "sender": m["sender"], "content": m["content"], "created_at": m["created_at"]}
+    return {"id": m["id"], "sender": m["sender"], "msg_type": m.get("msg_type") or "text",
+            "content": m["content"], "created_at": m["created_at"]}
+
+
+def preview_of(msg_type: str, content: str) -> str:
+    return "[图片]" if msg_type == "image" else content.replace("\n", " ")[:80]
 
 
 def conv_summary(conv_id: int) -> dict | None:
@@ -123,6 +152,12 @@ def conv_summary(conv_id: int) -> dict | None:
 def find_site(site_key: str) -> dict | None:
     with get_db() as db:
         r = db.execute("SELECT * FROM sites WHERE site_key = ?", (site_key,)).fetchone()
+    return dict(r) if r else None
+
+
+def get_site(site_id: int) -> dict | None:
+    with get_db() as db:
+        r = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
     return dict(r) if r else None
 
 
@@ -174,17 +209,17 @@ def history(conv_id: int, limit: int = HISTORY_LIMIT) -> list[dict]:
     return [_msg_out(m) for m in items]
 
 
-def add_message(conv_id: int, sender: str, content: str, page_url: str = "") -> dict:
+def add_message(conv_id: int, sender: str, content: str, page_url: str = "", msg_type: str = "text") -> dict:
     """写入一条消息并更新会话状态：
     访客消息 → 未读 +1，已结束的会话重新打开为 waiting；
-    客服消息 → 未读清零，会话变为 active；系统消息不改状态。"""
+    客服消息 → 未读清零，会话变为 active；AI / 系统消息不改状态。"""
     with get_db() as db:
         cur = db.execute(
-            "INSERT INTO chat_messages (conversation_id, sender, content) VALUES (?,?,?)",
-            (conv_id, sender, content),
+            "INSERT INTO chat_messages (conversation_id, sender, content, msg_type) VALUES (?,?,?,?)",
+            (conv_id, sender, content, msg_type),
         )
         msg = dict(db.execute("SELECT * FROM chat_messages WHERE id = ?", (cur.lastrowid,)).fetchone())
-        preview = content.replace("\n", " ")[:80]
+        preview = preview_of(msg_type, content)
         if sender == "visitor":
             db.execute(
                 "UPDATE conversations SET last_msg_at = ?, last_preview = ?, unread = unread + 1, "
@@ -199,6 +234,9 @@ def add_message(conv_id: int, sender: str, content: str, page_url: str = "") -> 
                 "closed_at = NULL WHERE id = ?",
                 (msg["created_at"], preview, conv_id),
             )
+        elif sender == "ai":
+            db.execute("UPDATE conversations SET last_msg_at = ?, last_preview = ? WHERE id = ?",
+                       (msg["created_at"], "[AI] " + preview, conv_id))
     return _msg_out(msg)
 
 
@@ -208,13 +246,20 @@ async def broadcast_message(conv_id: int, msg: dict, client_id: str = ""):
     await hub.to_admins({"type": "msg", "conversation": conv_summary(conv_id), "message": msg})
 
 
-async def agent_reply(conv_id: int, content: str) -> tuple[dict, bool]:
+async def agent_reply(conv_id: int, content: str, msg_type: str = "text") -> tuple[dict, bool]:
     """客服回复（网页后台和 QQ 共用）。返回 (消息, 访客当前是否在线)。"""
-    msg = add_message(conv_id, "agent", content)
+    msg = add_message(conv_id, "agent", content, msg_type=msg_type)
     delivered = hub.visitor_online(conv_id)
     await broadcast_message(conv_id, msg)
     await hub.to_visitor(conv_id, {"type": "status", "status": "active"})
     return msg, delivered
+
+
+async def post_message(conv_id: int, sender: str, content: str) -> dict:
+    """AI / 系统消息。"""
+    msg = add_message(conv_id, sender, content)
+    await broadcast_message(conv_id, msg)
+    return msg
 
 
 async def set_conversation_status(conv_id: int, status: str):
@@ -228,10 +273,19 @@ async def set_conversation_status(conv_id: int, status: str):
         else:
             db.execute("UPDATE conversations SET status = 'waiting', closed_at = NULL WHERE id = ?", (conv_id,))
     if status == "closed":
-        msg = add_message(conv_id, "system", "对话已结束。如还有问题，直接发送消息即可重新联系客服。")
-        await broadcast_message(conv_id, msg)
+        await post_message(conv_id, "system", "对话已结束。如还有问题，直接发送消息即可重新联系客服。")
     await hub.to_visitor(conv_id, {"type": "status", "status": status})
     await hub.to_admins({"type": "conv", "conversation": conv_summary(conv_id)})
+
+
+def _profile(visitor: dict | None) -> dict | None:
+    if not visitor:
+        return None
+    return {"name": visitor["name"], "contact": visitor["contact"]}
+
+
+def _profile_complete(visitor: dict | None) -> bool:
+    return bool(visitor and visitor["name"] and visitor["contact"])
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +317,7 @@ async def visitor_ws(ws: WebSocket):
     ua = ws.headers.get("user-agent", "")
     page_url = str(hello.get("page_url", ""))[:500]
 
-    # 访客身份与会话都是第一次发消息时才创建，只打开挂件不会产生数据
+    # 访客身份在填写资料或第一次发消息时才创建，只打开挂件不会产生数据
     visitor = find_visitor(str(hello.get("token", "")))
     conv = find_conversation(site["id"], visitor["id"]) if visitor else None
     if conv:
@@ -271,9 +325,22 @@ async def visitor_ws(ws: WebSocket):
         await hub.to_admins({"type": "conv", "conversation": conv_summary(conv["id"])})
     await hub._send(ws, {
         "type": "init",
+        "site": site_public_config(site),
+        "profile": _profile(visitor),
         "conversation": {"id": conv["id"], "status": conv["status"]} if conv else None,
         "messages": history(conv["id"]) if conv else [],
     })
+
+    async def ensure_visitor(client_id: str = "") -> bool:
+        nonlocal visitor
+        if visitor:
+            return True
+        if not _new_visitor_by_ip.allow(ip):
+            await hub._send(ws, {"type": "error", "error": "操作过于频繁，请稍后再试", "client_id": client_id})
+            return False
+        visitor = create_visitor(ip, ua, page_url)
+        await hub._send(ws, {"type": "token", "token": visitor["token"]})
+        return True
 
     try:
         while True:
@@ -284,34 +351,57 @@ async def visitor_ws(ws: WebSocket):
             if kind == "ping":
                 await hub._send(ws, {"type": "pong"})
                 continue
+
+            if kind == "profile":
+                name = str(data.get("name", "")).strip()[:MAX_NAME]
+                contact = str(data.get("contact", "")).strip()[:MAX_CONTACT]
+                if not name:
+                    await hub._send(ws, {"type": "error", "error": "请填写称呼", "field": "name"})
+                    continue
+                if not valid_contact(contact):
+                    await hub._send(ws, {"type": "error", "error": "请填写正确的电话或邮箱", "field": "contact"})
+                    continue
+                if not await ensure_visitor():
+                    continue
+                with get_db() as db:
+                    db.execute("UPDATE visitors SET name = ?, contact = ? WHERE id = ?", (name, contact, visitor["id"]))
+                visitor = {**visitor, "name": name, "contact": contact}
+                await hub._send(ws, {"type": "profile_ok", "profile": _profile(visitor)})
+                if conv:
+                    await hub.to_admins({"type": "conv", "conversation": conv_summary(conv["id"])})
+                continue
+
             if kind != "msg":
                 continue
 
-            content = str(data.get("content", "")).strip()
             client_id = str(data.get("client_id", ""))[:64]
+            msg_type = "image" if data.get("msg_type") == "image" else "text"
+            content = str(data.get("content", "")).strip()
             if not content:
+                continue
+            if msg_type == "image" and not media.local_path(content):
+                await hub._send(ws, {"type": "error", "error": "图片无效，请重新上传", "client_id": client_id})
                 continue
             if len(content) > MAX_CONTENT:
                 await hub._send(ws, {"type": "error", "error": f"单条消息不能超过 {MAX_CONTENT} 字", "client_id": client_id})
                 continue
+            site = find_site(site["site_key"]) or site   # 设置可能刚被修改
+            if site.get("require_contact", 1) and not _profile_complete(visitor):
+                await hub._send(ws, {"type": "error", "error": "请先填写称呼和联系方式", "client_id": client_id,
+                                     "need_profile": True})
+                continue
             if not _msg_by_ip.allow(ip) or (visitor and not _msg_by_visitor.allow(str(visitor["id"]))):
                 await hub._send(ws, {"type": "error", "error": "发送过于频繁，请稍后再试", "client_id": client_id})
                 continue
-
-            if not visitor:
-                if not _new_visitor_by_ip.allow(ip):
-                    await hub._send(ws, {"type": "error", "error": "发送过于频繁，请稍后再试", "client_id": client_id})
-                    continue
-                visitor = create_visitor(ip, ua, page_url)
-                _msg_by_visitor.allow(str(visitor["id"]))
-                await hub._send(ws, {"type": "token", "token": visitor["token"]})
+            if not await ensure_visitor(client_id):
+                continue
             if not conv:
                 conv = get_or_create_conversation(site["id"], visitor["id"])
                 hub.join(conv["id"], ws)
 
             msg_page = str(data.get("page_url", ""))[:500] or page_url
             was_closed = conv_summary(conv["id"])["status"] == "closed"
-            msg = add_message(conv["id"], "visitor", content, msg_page)
+            msg = add_message(conv["id"], "visitor", content, msg_page, msg_type)
             await broadcast_message(conv["id"], msg, client_id)
             if was_closed:
                 await hub.to_visitor(conv["id"], {"type": "status", "status": "waiting"})
@@ -321,11 +411,11 @@ async def visitor_ws(ws: WebSocket):
                 try:
                     await hook(summary, msg)
                 except Exception as e:  # noqa: BLE001
-                    print(f"[chat] hook 执行失败: {e}")
+                    print(f"[chat] hook 执行失败: {e!r}", flush=True)
     except (WebSocketDisconnect, RuntimeError):
         pass
     except Exception as e:  # noqa: BLE001  无效 JSON 等
-        print(f"[chat] 访客连接异常: {e}")
+        print(f"[chat] 访客连接异常: {e!r}", flush=True)
     finally:
         if conv:
             hub.leave(conv["id"], ws)
@@ -433,17 +523,21 @@ async def mark_read(conv_id: int):
 
 class ReplyIn(BaseModel):
     content: str
+    msg_type: str = "text"
 
 
 @router.post("/api/admin/conversations/{conv_id}/messages", tags=["对话"], dependencies=[admin])
 async def reply(conv_id: int, body: ReplyIn):
     _require_conv(conv_id)
     content = body.content.strip()
+    msg_type = "image" if body.msg_type == "image" else "text"
     if not content:
         raise HTTPException(400, "内容不能为空")
+    if msg_type == "image" and not media.local_path(content):
+        raise HTTPException(400, "图片无效，请重新上传")
     if len(content) > MAX_CONTENT:
         raise HTTPException(400, f"单条消息不能超过 {MAX_CONTENT} 字")
-    msg, delivered = await agent_reply(conv_id, content)
+    msg, delivered = await agent_reply(conv_id, content, msg_type)
     return {"message": msg, "delivered": delivered}
 
 

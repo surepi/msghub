@@ -57,11 +57,12 @@
 
   // ---------- 路由 ----------
   function route() {
-    const v = ["#sites", "#messages"].includes(location.hash) ? location.hash.slice(1) : "chats";
+    const v = ["#sites", "#messages", "#ai"].includes(location.hash) ? location.hash.slice(1) : "chats";
     $$(".top nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === v));
-    ["chats", "messages", "sites"].forEach((n) => $("#view-" + n).classList.toggle("hidden", v !== n));
+    ["chats", "messages", "sites", "ai"].forEach((n) => $("#view-" + n).classList.toggle("hidden", v !== n));
     document.body.dataset.view = v;
     if (v === "sites") { renderSites(); loadQQ(); }
+    if (v === "ai") loadAI();
   }
   window.addEventListener("hashchange", route);
 
@@ -153,12 +154,23 @@
     const f = $("#siteForm");
     f.reset();
     $("#siteModalTitle").textContent = s ? "编辑站点" : "新建站点";
+    let wh = null;
     if (s) {
-      ["name", "domain", "allowed_origins", "webhook_url"].forEach((k) => (f[k].value = s[k]));
+      ["name", "domain", "allowed_origins", "webhook_url", "welcome", "offline_text", "crawl_urls"]
+        .forEach((k) => (f[k].value = s[k] || ""));
       f.enabled.checked = !!s.enabled;
+      f.require_contact.checked = !!s.require_contact;
+      f.ai_enabled.checked = !!s.ai_enabled;
+      try { wh = s.work_hours ? JSON.parse(s.work_hours) : null; } catch (_) { wh = null; }
     }
+    f.wh_all.checked = !wh;
+    $$("[name=wh_day]", f).forEach((c) => (c.checked = wh ? wh.days.includes(+c.value) : +c.value <= 5));
+    f.wh_start.value = wh ? wh.start : "09:00";
+    f.wh_end.value = wh ? wh.end : "18:00";
+    $(".wh-detail", f).classList.toggle("hidden", !wh);
     $("#siteModal").classList.remove("hidden");
   }
+  $("#siteForm").wh_all.onchange = (e) => $(".wh-detail").classList.toggle("hidden", e.target.checked);
   $("#btnNewSite").onclick = () => openSite(null);
   $("#siteForm").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -166,6 +178,11 @@
     const body = {
       name: f.name.value, domain: f.domain.value, allowed_origins: f.allowed_origins.value,
       webhook_url: f.webhook_url.value, enabled: f.enabled.checked,
+      welcome: f.welcome.value, offline_text: f.offline_text.value, crawl_urls: f.crawl_urls.value,
+      require_contact: f.require_contact.checked, ai_enabled: f.ai_enabled.checked,
+      work_hours: f.wh_all.checked ? null : {
+        days: $$("[name=wh_day]:checked", f).map((c) => +c.value), start: f.wh_start.value, end: f.wh_end.value,
+      },
     };
     try {
       if (state.editingSite) await api(`/api/admin/sites/${state.editingSite.id}`, { method: "PUT", body });
@@ -302,6 +319,139 @@
   }));
   document.addEventListener("keydown", (e) => e.key === "Escape" && $$(".drawer").forEach((d) => d.classList.add("hidden")));
 
+  // ---------- AI ----------
+  function siteOptions(sel, all, value) {
+    sel.innerHTML = (all ? '<option value="">所有站点</option>' : "") +
+      state.sites.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join("");
+    if (value !== undefined && value !== null) sel.value = String(value);
+    if (sel.selectedIndex < 0 && sel.options.length) sel.selectedIndex = 0;
+  }
+
+  async function loadAI() {
+    let s;
+    try { s = await api("/api/admin/ai/settings"); } catch (err) { return toast(err.message); }
+    const f = $("#aiForm");
+    f.enabled.checked = s.enabled;
+    f.base_url.value = s.base_url;
+    f.model.value = s.model;
+    f.prompt.value = s.prompt;
+    f.no_reply_minutes.value = s.no_reply_minutes;
+    f.api_key.value = "";
+    f.api_key.placeholder = s.has_key ? `已设置（${s.key_hint}），不修改请留空` : "填写 API Key";
+    const ready = s.enabled && s.has_key && s.model && s.base_url;
+    $("#aiState").innerHTML = ready ? '<span class="tag handled">已开启</span>'
+      : `<span class="tag read">${s.enabled ? "已开启，但接口信息不完整" : "未开启"}</span>`;
+    siteOptions($("#aiTestSite"), false, $("#aiTestSite").value);
+    siteOptions($("#qaSite"), true, $("#qaSite").value);
+    siteOptions($("#kbSite"), false, $("#kbSite").value);
+    loadQA().catch((e) => toast(e.message));
+    loadKB().catch((e) => toast(e.message));
+  }
+
+  $("#aiForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const body = { enabled: f.enabled.checked, base_url: f.base_url.value, model: f.model.value,
+      prompt: f.prompt.value, no_reply_minutes: +f.no_reply_minutes.value || 3 };
+    if (f.api_key.value.trim()) body.api_key = f.api_key.value.trim();
+    try { await api("/api/admin/ai/settings", { method: "PUT", body }); toast("已保存"); loadAI(); }
+    catch (err) { toast(err.message); }
+  });
+
+  $("#aiTestBtn").onclick = async () => {
+    const q = $("#aiTestQ").value.trim();
+    if (!q) return toast("请输入一个问题");
+    const out = $("#aiTestOut");
+    out.classList.remove("hidden");
+    out.textContent = "AI 思考中…（使用已保存的设置）";
+    try {
+      const r = await api("/api/admin/ai/test", { method: "POST", body: { question: q, site_id: +$("#aiTestSite").value || null } });
+      out.innerHTML = `<b>${r.handoff ? "转人工" : "AI 回答"}：</b>${esc(r.answer) || "（无）"}
+        <details><summary>参考到的资料（${r.context ? r.context.length + " 字" : "无"}）</summary>
+        <pre>${esc(r.context || "没有匹配到资料")}</pre></details>`;
+    } catch (err) { out.textContent = "测试失败：" + err.message; }
+  };
+
+  let qaItems = [], editingQA = null;
+  async function loadQA() {
+    const sid = $("#qaSite").value;
+    qaItems = await api("/api/admin/qa" + (sid ? `?site_id=${sid}` : ""));
+    const siteName = (id) => (id ? (state.sites.find((s) => s.id === id) || {}).name || "已删除的站点" : "所有站点");
+    $("#qaList").innerHTML = qaItems.length ? qaItems.map((q) => `
+      <div class="qa" data-id="${q.id}">
+        <div class="qa-q"><b>${esc(q.question)}</b><span class="muted">${esc(siteName(q.site_id))}</span><span class="spacer"></span>
+          <button class="btn sm" data-qa="edit">编辑</button><button class="btn sm danger" data-qa="del">删除</button></div>
+        <div class="qa-a">${esc(q.answer)}</div>
+      </div>`).join("") : '<div class="empty">还没有问答。添加常见问题和标准答案，AI 会优先参考。</div>';
+  }
+  function openQA(q) {
+    editingQA = q || null;
+    const f = $("#qaForm");
+    f.reset();
+    siteOptions(f.site_id, true, q ? q.site_id || "" : $("#qaSite").value);
+    $("#qaModalTitle").textContent = q ? "编辑问答" : "添加问答";
+    if (q) { f.question.value = q.question; f.answer.value = q.answer; }
+    $("#qaModal").classList.remove("hidden");
+  }
+  $("#qaNew").onclick = () => openQA(null);
+  $("#qaSite").onchange = () => loadQA().catch((e) => toast(e.message));
+  $("#qaForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const body = { question: f.question.value, answer: f.answer.value, site_id: +f.site_id.value || null };
+    try {
+      if (editingQA) await api(`/api/admin/qa/${editingQA.id}`, { method: "PUT", body });
+      else await api("/api/admin/qa", { method: "POST", body });
+      $("#qaModal").classList.add("hidden");
+      toast("已保存");
+      loadQA();
+    } catch (err) { toast(err.message); }
+  });
+  $("#qaList").addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-qa]");
+    if (!b) return;
+    const q = qaItems.find((x) => x.id === +b.closest(".qa").dataset.id);
+    if (b.dataset.qa === "edit") return openQA(q);
+    if (!confirm("删除这条问答？")) return;
+    try { await api(`/api/admin/qa/${q.id}`, { method: "DELETE" }); loadQA(); } catch (err) { toast(err.message); }
+  });
+
+  let kbTimer;
+  async function loadKB() {
+    clearTimeout(kbTimer);
+    const sid = $("#kbSite").value, box = $("#kbBox");
+    if (!sid) { box.innerHTML = '<div class="empty">请先在「站点」页创建站点</div>'; return; }
+    const r = await api(`/api/admin/kb/${sid}`);
+    const st = r.state || {};
+    const chars = r.pages.reduce((a, p) => a + p.chars, 0);
+    box.innerHTML = `
+      <dl class="kv">
+        <dt>抓取地址</dt><dd>${r.starts.length ? r.starts.map(esc).join("<br>")
+          : '<span class="muted">未设置：在站点设置里填写域名或抓取起始地址</span>'}</dd>
+        <dt>已收录</dt><dd>${r.pages.length} 个页面${r.pages.length ? `，共 ${chars} 字` : ""}</dd>
+        ${st.running ? "<dt>状态</dt><dd>抓取中…</dd>"
+          : st.finished_at ? `<dt>上次抓取</dt><dd>${esc(st.finished_at)} · ${st.ok ? `成功，${st.pages} 页` : esc(st.error)}</dd>` : ""}
+      </dl>
+      <div class="actions">
+        <button class="btn sm primary" data-kb="crawl" ${st.running || !r.starts.length ? "disabled" : ""}>立即抓取</button>
+        ${r.pages.length ? '<button class="btn sm danger" data-kb="clear">清空</button>' : ""}
+      </div>
+      ${r.pages.length ? `<details><summary>页面列表</summary><ul class="kb-pages">${r.pages.map((p) =>
+        `<li>${esc(p.title || p.url)} <span class="muted">${esc(p.url)} · ${p.chars} 字</span></li>`).join("")}</ul></details>` : ""}`;
+    if (st.running) kbTimer = setTimeout(() => loadKB().catch(() => {}), 3000);
+  }
+  $("#kbSite").onchange = () => loadKB().catch((e) => toast(e.message));
+  $("#kbBox").addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-kb]");
+    if (!b) return;
+    const sid = $("#kbSite").value;
+    try {
+      if (b.dataset.kb === "crawl") { await api(`/api/admin/kb/${sid}/crawl`, { method: "POST" }); toast("已开始抓取"); }
+      else { if (!confirm("清空该站点已抓取的网页资料？")) return; await api(`/api/admin/kb/${sid}`, { method: "DELETE" }); }
+      setTimeout(() => loadKB().catch(() => {}), 600);
+    } catch (err) { toast(err.message); }
+  });
+
   // ---------- QQ 机器人 ----------
   async function loadQQ() {
     const box = $("#qqCard");
@@ -411,8 +561,14 @@
     if (!box || chat.msgIds.has(m.id)) return;
     chat.msgIds.add(m.id);
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-    box.insertAdjacentHTML("beforeend", `<div class="msg ${esc(m.sender)}"><div class="bub">${esc(m.content)}${
+    const isImg = m.msg_type === "image" && /^\/uploads\/[\w.]+$/.test(m.content);
+    const body = isImg
+      ? `<a href="${esc(m.content)}" target="_blank" rel="noopener"><img src="${esc(m.content)}" alt="图片" loading="lazy"></a>`
+      : esc(m.content);
+    box.insertAdjacentHTML("beforeend", `<div class="msg ${esc(m.sender)}">${m.sender === "ai" ? '<div class="who">AI 助手</div>' : ""}
+      <div class="bub${isImg ? " img" : ""}">${body}${
       m.sender !== "system" ? `<time>${esc(shortTime(m.created_at))}</time>` : ""}</div></div>`);
+    if (isImg) $("img", box.lastElementChild).onload = () => { if (nearBottom) box.scrollTop = box.scrollHeight; };
     if (nearBottom || m.sender === "agent") box.scrollTop = box.scrollHeight;
   }
 
@@ -450,7 +606,9 @@
       <div class="chat-info">${info}</div>
       <div class="chat-msgs" id="chatMsgs"></div>
       <div class="chat-input">
-        <textarea id="replyInput" placeholder="输入回复，Enter 发送，Shift+Enter 换行" maxlength="5000"></textarea>
+        <button class="btn icon" id="replyPic" title="发送图片">🖼</button>
+        <input type="file" id="replyFile" accept="image/png,image/jpeg,image/gif,image/webp" hidden>
+        <textarea id="replyInput" placeholder="输入回复，Enter 发送，Shift+Enter 换行；可粘贴图片" maxlength="5000"></textarea>
         <button class="btn primary" id="replyBtn">发送</button>
       </div>`;
     renderChatHead();
@@ -459,6 +617,12 @@
     $(".chat-layout").classList.add("has-conv");
     renderConvList();
     $("#replyBtn").onclick = sendReply;
+    $("#replyPic").onclick = () => $("#replyFile").click();
+    $("#replyFile").onchange = (e) => { sendImageReply(e.target.files[0]); e.target.value = ""; };
+    $("#replyInput").addEventListener("paste", (e) => {
+      const f = e.clipboardData && e.clipboardData.files[0];
+      if (f && f.type.startsWith("image/")) { e.preventDefault(); sendImageReply(f); }
+    });
     $("#replyInput").addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); sendReply(); }
     });
@@ -484,6 +648,21 @@
       if (!r.delivered) toast("访客当前不在线，下次打开网页时会看到回复");
     } catch (err) { toast(err.message); }
     finally { btn.disabled = false; t.focus(); }
+  }
+
+  async function sendImageReply(file) {
+    if (!file || !chat.cur) return;
+    if (file.size > 5 * 1024 * 1024) return toast("图片不能超过 5MB");
+    const convId = chat.cur.id;
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch("/api/admin/upload", { method: "POST", headers: { Authorization: "Bearer " + token }, body: fd });
+      const up = await res.json();
+      if (!res.ok) throw new Error(up.detail || "上传失败");
+      const r = await api(`/api/admin/conversations/${convId}/messages`, { method: "POST", body: { content: up.url, msg_type: "image" } });
+      appendMsg(r.message);
+    } catch (err) { toast(err.message); }
   }
 
   $("#chatPane").addEventListener("click", async (e) => {

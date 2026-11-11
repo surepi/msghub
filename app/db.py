@@ -98,7 +98,52 @@ CREATE TABLE IF NOT EXISTS qq_forwards (
     conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     created_at      TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
 );
+
+-- ---------- 二期 ③：AI 与站点设置 ----------
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
+
+-- 问答库：site_id 为空表示所有站点通用
+CREATE TABLE IF NOT EXISTS qa (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id     INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+    question    TEXT    NOT NULL,
+    answer      TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
+-- 抓取的网站页面（AI 资料补充）
+CREATE TABLE IF NOT EXISTS kb_pages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id     INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+    url         TEXT    NOT NULL,
+    title       TEXT    NOT NULL DEFAULT '',
+    text        TEXT    NOT NULL DEFAULT '',
+    fetched_at  TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
+    UNIQUE (site_id, url)
+);
 """
+
+# 老库迁移：表 → [(列名, 定义)]
+MIGRATIONS = {
+    "messages": [("conversation_id", "INTEGER")],                       # 留言关联来源会话
+    "chat_messages": [
+        ("qq_state", "TEXT NOT NULL DEFAULT ''"),                       # '' / pending / sent
+        ("msg_type", "TEXT NOT NULL DEFAULT 'text'"),                   # text / image（content 为图片路径）
+    ],
+    "sites": [
+        ("welcome", "TEXT NOT NULL DEFAULT ''"),                        # 欢迎语，空 = 默认
+        ("offline_text", "TEXT NOT NULL DEFAULT ''"),                   # 离线提示语，空 = 默认
+        ("work_hours", "TEXT NOT NULL DEFAULT ''"),                     # JSON {"days":[1..7],"start":"09:00","end":"18:00"}，空 = 全天
+        ("require_contact", "INTEGER NOT NULL DEFAULT 1"),              # 对话前必须留称呼和联系方式
+        ("ai_enabled", "INTEGER NOT NULL DEFAULT 1"),                   # 该站点是否使用 AI 应答（需全局开启）
+        ("crawl_urls", "TEXT NOT NULL DEFAULT ''"),                     # 抓取起始地址，每行一个
+    ],
+    "conversations": [("auto_handled_upto", "INTEGER NOT NULL DEFAULT 0")],  # 已由 AI / 转留言处理到的访客消息 ID
+}
 
 STATUSES = ("new", "read", "handled", "spam")
 CONV_STATUSES = ("waiting", "active", "closed")
@@ -125,14 +170,23 @@ def get_db():
 def init_db():
     with get_db() as conn:
         conn.executescript(SCHEMA)
-        # 老库迁移：留言关联来源会话（离线会话归档为留言时使用）
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
-        if "conversation_id" not in cols:
-            conn.execute("ALTER TABLE messages ADD COLUMN conversation_id INTEGER")
-        # 访客消息转发到 QQ 的状态：'' 未涉及 / pending 待发 / sent 已发
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(chat_messages)")}
-        if "qq_state" not in cols:
-            conn.execute("ALTER TABLE chat_messages ADD COLUMN qq_state TEXT NOT NULL DEFAULT ''")
+        for table, columns in MIGRATIONS.items():
+            have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in columns:
+                if name not in have:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with get_db() as db:
+        r = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return r[0] if r else default
+
+
+def set_settings(values: dict[str, str]):
+    with get_db() as db:
+        db.executemany("INSERT INTO settings (key, value) VALUES (?, ?) "
+                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value", list(values.items()))
 
 
 def rows(cur) -> list[dict]:

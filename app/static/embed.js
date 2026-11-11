@@ -8,7 +8,7 @@
  * 嵌入到页面某个位置：加 data-target="#容器选择器"
  * 旧版留言表单：加 data-mode="form"
  *
- * 其他可选属性：data-title 标题、data-color 主题色、data-welcome 欢迎语
+ * 其他可选属性：data-title 标题、data-color 主题色、data-welcome 欢迎语（后台设置了欢迎语时以后台为准）
  */
 (function () {
   "use strict";
@@ -47,23 +47,35 @@
     ".mh-float{position:fixed;right:20px;bottom:88px;z-index:2147483000;width:360px;max-width:calc(100vw - 32px);box-shadow:0 10px 36px rgba(0,0,0,.2);display:none}" +
     "@media (max-width:480px){.mh-float{right:16px;left:16px;width:auto;bottom:84px}}" +
     // 对话
-    ".mh-chat{display:flex;flex-direction:column;height:480px;max-height:calc(100vh - 120px);overflow:hidden}" +
-    ".mh-inline.mh-chat{height:520px;max-width:520px}" +
-    ".mh-head{background:" + C + ";color:#fff;padding:12px 16px;display:flex;align-items:center;gap:8px}" +
-    ".mh-head b{font-size:15px;flex:1}.mh-head small{opacity:.85;font-size:12px}" +
+    ".mh-chat{display:flex;flex-direction:column;height:500px;max-height:calc(100vh - 120px);overflow:hidden}" +
+    ".mh-inline.mh-chat{height:540px;max-width:520px}" +
+    ".mh-head{background:" + C + ";color:#fff;padding:12px 16px}" +
+    ".mh-head b{display:block;font-size:15px}.mh-head small{opacity:.9;font-size:12px}" +
+    ".mh-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:1px;background:#9ca3af}.mh-dot.on{background:#4ade80}" +
     ".mh-list{flex:1;overflow-y:auto;padding:12px;background:#f7f8fa}" +
-    ".mh-row{display:flex;margin:8px 0}.mh-row.me{justify-content:flex-end}.mh-row.sys{justify-content:center}" +
+    ".mh-row{display:flex;flex-direction:column;align-items:flex-start;margin:8px 0}.mh-row.me{align-items:flex-end}.mh-row.sys{align-items:center}" +
+    ".mh-who{font-size:11px;color:#6b7280;margin:0 4px 2px}" +
     ".mh-b{max-width:78%;padding:8px 12px;border-radius:12px;white-space:pre-wrap;word-break:break-word;background:#fff;border:1px solid #e5e7eb}" +
     ".mh-row.me .mh-b{background:" + C + ";color:#fff;border-color:" + C + "}" +
+    ".mh-row.ai .mh-b{background:#f5f3ff;border-color:#ddd6fe}" +
     ".mh-row.sys .mh-b{background:none;border:0;color:#6b7280;font-size:12px;text-align:center;max-width:90%;padding:2px 8px}" +
+    ".mh-b img{display:block;max-width:100%;max-height:220px;border-radius:6px;cursor:zoom-in}" +
+    ".mh-row.me .mh-b.mh-img,.mh-b.mh-img{padding:4px;background:#fff;border-color:#e5e7eb;color:#6b7280}" +
     ".mh-t{display:block;font-size:11px;opacity:.6;margin-top:2px}" +
     ".mh-row.pending .mh-b{opacity:.6}.mh-row.failed .mh-b{background:#fee2e2;color:#991b1b;border-color:#fecaca}" +
-    ".mh-foot{border-top:1px solid #e5e7eb;padding:8px;display:flex;gap:8px;align-items:flex-end;background:#fff}" +
+    ".mh-foot{border-top:1px solid #e5e7eb;padding:8px;display:flex;gap:6px;align-items:flex-end;background:#fff}" +
     ".mh-foot textarea{flex:1;resize:none;border:1px solid #d1d5db;border-radius:8px;padding:8px 10px;font:inherit;color:inherit;height:40px;max-height:120px;background:#fff;margin:0}" +
     ".mh-btn{border:0;border-radius:8px;background:" + C + ";color:#fff;font:inherit;padding:0 16px;height:40px;cursor:pointer}" +
     ".mh-btn:disabled{opacity:.5;cursor:default}" +
+    ".mh-icon{border:1px solid #d1d5db;background:#fff;border-radius:8px;width:40px;height:40px;cursor:pointer;font-size:18px;padding:0;color:#4b5563}" +
     ".mh-net{font-size:12px;color:#b45309;background:#fef3c7;padding:4px 12px;display:none}" +
-    // 表单
+    ".mh-off{font-size:12px;color:#92400e;background:#fffbeb;border-bottom:1px solid #fde68a;padding:6px 12px;display:none}" +
+    // 资料表单
+    ".mh-pre{position:absolute;left:0;right:0;bottom:0;top:0;background:#fff;display:none;flex-direction:column;justify-content:center;padding:24px;gap:10px}" +
+    ".mh-pre p{margin:0 0 4px;color:#4b5563;font-size:13px}" +
+    ".mh-pre input{width:100%;padding:9px 10px;border:1px solid #d1d5db;border-radius:8px;font:inherit;color:inherit;background:#fff}" +
+    ".mh-pre .mh-err{color:#dc2626;font-size:12px;min-height:16px}" +
+    // 表单模式
     ".mh-form{padding:16px;max-width:420px}.mh-form h3{margin:0 0 12px;font-size:16px}" +
     ".mh-form input,.mh-form textarea{width:100%;margin:0 0 10px;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;font:inherit;color:inherit;background:#fff}" +
     ".mh-form textarea{min-height:100px;resize:vertical}.mh-form .mh-btn{width:100%}" +
@@ -91,7 +103,7 @@
     fab.onclick = function () { setOpen(box.style.display === "none" || !box.style.display); };
     document.body.appendChild(box);
     document.body.appendChild(fab);
-    return { inline: false, badge: badge, close: function () { setOpen(false); } };
+    return { inline: false, badge: badge };
   }
 
   function ready(fn) {
@@ -134,41 +146,74 @@
   function chatWidget() {
     var wsUrl = new URL("/api/chat/ws", base);
     wsUrl.protocol = base.protocol === "https:" ? "wss:" : "ws:";
+    var uploadUrl = new URL("/api/chat/upload", base).href;
     var TOKEN_KEY = "msghub:" + cfg.siteKey;
 
     var box = el("div", "mh-box mh-chat");
     var head = el("div", "mh-head");
-    var titleWrap = el("div");
-    titleWrap.style.flex = "1";
     var title = el("b", null, cfg.title || "在线咨询");
-    var sub = el("small", null, "");
-    title.style.display = "block";
-    titleWrap.appendChild(title); titleWrap.appendChild(sub);
-    head.appendChild(titleWrap);
+    var sub = el("small");
+    var dot = el("span", "mh-dot");
+    var subText = el("span", null, "");
+    sub.appendChild(dot); sub.appendChild(subText);
+    head.appendChild(title); head.appendChild(sub);
     var net = el("div", "mh-net", "连接中断，正在重连…");
+    var off = el("div", "mh-off");
     var list = el("div", "mh-list");
     var foot = el("div", "mh-foot");
+    var picBtn = el("button", "mh-icon", "🖼");
+    picBtn.type = "button"; picBtn.title = "发送图片";
+    var picInput = el("input");
+    picInput.type = "file"; picInput.accept = "image/png,image/jpeg,image/gif,image/webp"; picInput.style.display = "none";
     var input = el("textarea");
     input.placeholder = "输入消息，Enter 发送";
     input.maxLength = 5000;
     var send = el("button", "mh-btn", "发送");
     send.type = "button";
-    foot.appendChild(input); foot.appendChild(send);
-    box.appendChild(head); box.appendChild(net); box.appendChild(list); box.appendChild(foot);
+    foot.appendChild(picBtn); foot.appendChild(picInput); foot.appendChild(input); foot.appendChild(send);
+
+    // 对话前填写资料
+    var pre = el("form", "mh-pre");
+    pre.innerHTML = '<p>开始咨询前，请留下您的称呼和联系方式，方便客服及时联系您。</p>' +
+      '<input name="name" placeholder="您的称呼" maxlength="100" autocomplete="name">' +
+      '<input name="contact" placeholder="手机号或邮箱" maxlength="200" autocomplete="tel">' +
+      '<div class="mh-err"></div><button type="submit" class="mh-btn">开始咨询</button>';
+    var preErr = pre.querySelector(".mh-err");
+
+    var body = el("div");
+    body.style.cssText = "flex:1;display:flex;flex-direction:column;position:relative;min-height:0";
+    body.appendChild(off); body.appendChild(list); body.appendChild(pre);
+    box.appendChild(head); box.appendChild(net); box.appendChild(body); box.appendChild(foot);
 
     var ws = null, connected = false, retry = 0, retryTimer = null, pingTimer = null;
     var isOpen = false, unread = 0, seen = {}, pending = {}, ui = null;
+    var site = null, profileOk = false;
 
     function fmtTime(s) { return s ? String(s).slice(11, 16) : ""; }
     function scroll() { list.scrollTop = list.scrollHeight; }
+    function abs(path) { return new URL(path, base).href; }
     function setSub(status) {
-      sub.textContent = status === "closed" ? "对话已结束，发送消息可重新开始"
-        : status === "active" ? "客服已接入" : status === "waiting" ? "已收到，客服会尽快回复" : "";
+      var online = site && site.online;
+      dot.className = "mh-dot" + (online ? " on" : "");
+      subText.textContent = status === "closed" ? "对话已结束，发送消息可重新开始"
+        : status === "active" ? "客服已接入" : online ? "客服在线" : "客服不在线，可先留言";
     }
 
-    function bubble(sender, text, time) {
-      var row = el("div", "mh-row " + (sender === "visitor" ? "me" : sender === "system" ? "sys" : "them"));
-      var b = el("div", "mh-b", text);
+    function bubble(sender, msgType, content, time) {
+      var cls = sender === "visitor" ? "me" : sender === "system" ? "sys" : sender === "ai" ? "ai" : "them";
+      var row = el("div", "mh-row " + cls);
+      if (sender === "ai") row.appendChild(el("div", "mh-who", "AI 助手"));
+      var b = el("div", "mh-b" + (msgType === "image" ? " mh-img" : ""));
+      if (msgType === "image") {
+        var img = el("img");
+        img.src = content.indexOf("blob:") === 0 ? content : abs(content);
+        img.alt = "图片";
+        img.onload = scroll;
+        img.onclick = function () { window.open(img.src, "_blank", "noopener"); };
+        b.appendChild(img);
+      } else {
+        b.textContent = content;
+      }
       if (time && sender !== "system") b.appendChild(el("span", "mh-t", fmtTime(time)));
       row.appendChild(b);
       list.appendChild(row);
@@ -177,9 +222,14 @@
     function render(m) {
       if (seen[m.id]) return;
       seen[m.id] = 1;
-      bubble(m.sender, m.content, m.created_at);
+      bubble(m.sender, m.msg_type, m.content, m.created_at);
     }
-    function welcome() { bubble("agent", cfg.welcome); }
+
+    function showPre(show) {
+      pre.style.display = show ? "flex" : "none";
+      input.disabled = picBtn.disabled = send.disabled = show;
+      if (show) setTimeout(function () { pre.querySelector("[name=name]").focus(); }, 0);
+    }
 
     function bump() {
       if (isOpen || !ui || !ui.badge) return;
@@ -188,36 +238,48 @@
       ui.badge.style.display = "block";
     }
 
+    function wsSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
     function connect() {
       if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
       clearTimeout(retryTimer);
       try { ws = new WebSocket(wsUrl.href); } catch (_) { return scheduleRetry(); }
       ws.onopen = function () {
-        ws.send(JSON.stringify({ type: "hello", site_key: cfg.siteKey, token: store(TOKEN_KEY) || "", page_url: location.href }));
+        wsSend({ type: "hello", site_key: cfg.siteKey, token: store(TOKEN_KEY) || "", page_url: location.href });
       };
       ws.onmessage = function (ev) {
         var d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         if (d.type === "init") {
           connected = true; retry = 0;
+          site = d.site || {};
+          profileOk = !site.require_contact || !!(d.profile && d.profile.name && d.profile.contact);
           net.style.display = "none";
+          off.textContent = site.offline_text || "";
+          off.style.display = site.online ? "none" : "block";
           list.textContent = ""; seen = {};
-          welcome();
+          bubble("agent", "text", (site.welcome && site.welcome !== "您好，请问有什么可以帮您？") ? site.welcome : cfg.welcome);
           (d.messages || []).forEach(render);
           Object.keys(pending).forEach(function (cid) { list.appendChild(pending[cid].row); });
           setSub(d.conversation && d.conversation.status);
+          showPre(!profileOk);
           scroll();
           flushPending();
           clearInterval(pingTimer);
-          pingTimer = setInterval(function () { if (ws.readyState === 1) ws.send('{"type":"ping"}'); }, 25000);
+          pingTimer = setInterval(function () { wsSend({ type: "ping" }); }, 25000);
         } else if (d.type === "token") {
           store(TOKEN_KEY, d.token);
+        } else if (d.type === "profile_ok") {
+          profileOk = true;
+          showPre(false);
+          input.focus();
+          flushPending();
         } else if (d.type === "msg") {
           var p = d.client_id && pending[d.client_id];
           if (p) {
             seen[d.message.id] = 1;
             p.row.className = "mh-row me";
-            p.row.firstChild.appendChild(el("span", "mh-t", fmtTime(d.message.created_at)));
+            p.row.lastChild.appendChild(el("span", "mh-t", fmtTime(d.message.created_at)));
             delete pending[d.client_id];
           } else {
             render(d.message);
@@ -227,9 +289,14 @@
         } else if (d.type === "status") {
           setSub(d.status);
         } else if (d.type === "error") {
+          if (pre.style.display === "flex" && !d.client_id) { preErr.textContent = d.error; return; }
+          if (d.need_profile) { profileOk = false; showPre(true); }
           var f = d.client_id && pending[d.client_id];
-          if (f) { f.row.className = "mh-row me failed"; f.row.title = d.error; delete pending[d.client_id]; }
-          bubble("system", d.error);
+          if (f) {
+            if (d.need_profile) { f.sent = false; return; }   // 填完资料后自动重发
+            f.row.className = "mh-row me failed"; f.row.title = d.error; delete pending[d.client_id];
+          }
+          bubble("system", "text", d.error);
           scroll();
         }
       };
@@ -252,25 +319,57 @@
     }
 
     function flushPending() {
+      if (!connected || !profileOk) return;
       Object.keys(pending).forEach(function (cid) {
         var p = pending[cid];
-        if (!p.sent && connected) {
-          ws.send(JSON.stringify({ type: "msg", content: p.text, client_id: cid, page_url: location.href }));
+        if (!p.sent && p.content) {
+          wsSend({ type: "msg", msg_type: p.msgType, content: p.content, client_id: cid, page_url: location.href });
           p.sent = true;
         }
       });
     }
 
+    function newCid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+
     function doSend() {
       var text = input.value.trim();
       if (!text) return;
-      var cid = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      pending[cid] = { text: text, row: bubble("visitor", text), sent: false };
+      var cid = newCid();
+      pending[cid] = { msgType: "text", content: text, row: bubble("visitor", "text", text), sent: false };
       pending[cid].row.className = "mh-row me pending";
       input.value = "";
       scroll();
       if (connected) flushPending(); else connect();
     }
+
+    function sendImage(file) {
+      if (!file || !/^image\//.test(file.type)) return;
+      if (file.size > 5 * 1024 * 1024) { bubble("system", "text", "图片不能超过 5MB"); scroll(); return; }
+      var token = store(TOKEN_KEY);
+      if (!token) { bubble("system", "text", "请先发送一条文字消息，再发送图片"); scroll(); return; }
+      var cid = newCid();
+      var p = pending[cid] = { msgType: "image", content: "", row: bubble("visitor", "image", URL.createObjectURL(file)), sent: false };
+      p.row.className = "mh-row me pending";
+      scroll();
+      var fd = new FormData();
+      fd.append("site_key", cfg.siteKey);
+      fd.append("token", token);
+      fd.append("file", file);
+      fetch(uploadUrl, { method: "POST", body: fd })
+        .then(function (r) { return r.json(); })
+        .then(function (r) {
+          if (!r.url) throw new Error(r.error || "上传失败");
+          p.content = r.url;
+          if (connected) flushPending(); else connect();
+        })
+        .catch(function (err) {
+          p.row.className = "mh-row me failed"; p.row.title = err.message;
+          delete pending[cid];
+          bubble("system", "text", "图片发送失败：" + err.message);
+          scroll();
+        });
+    }
+
     send.onclick = doSend;
     input.addEventListener("keydown", function (e) {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
@@ -278,8 +377,26 @@
         doSend();
       }
     });
+    input.addEventListener("paste", function (e) {
+      var items = (e.clipboardData && e.clipboardData.files) || [];
+      if (items.length && /^image\//.test(items[0].type)) { e.preventDefault(); sendImage(items[0]); }
+    });
+    picBtn.onclick = function () { picInput.click(); };
+    picInput.onchange = function () { sendImage(picInput.files[0]); picInput.value = ""; };
+    pre.addEventListener("submit", function (e) {
+      e.preventDefault();
+      preErr.textContent = "";
+      var name = pre.querySelector("[name=name]").value.trim();
+      var contact = pre.querySelector("[name=contact]").value.trim();
+      if (!name) { preErr.textContent = "请填写称呼"; return; }
+      if (!/^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$/.test(contact) && (contact.replace(/\D/g, "").length < 7 || !/^\+?[\d\- ()]+$/.test(contact))) {
+        preErr.textContent = "请填写正确的手机号或邮箱"; return;
+      }
+      if (!connected) { preErr.textContent = "正在连接，请稍候再试"; connect(); return; }
+      wsSend({ type: "profile", name: name, contact: contact });
+    });
 
-    welcome();
+    bubble("agent", "text", cfg.welcome);
     ready(function () {
       ui = mount(box, function (open) {
         isOpen = open;
@@ -287,7 +404,7 @@
           unread = 0;
           if (ui && ui.badge) ui.badge.style.display = "none";
           connect();
-          setTimeout(function () { scroll(); input.focus(); }, 0);
+          setTimeout(function () { scroll(); if (profileOk) input.focus(); }, 0);
         }
       });
       if (ui.inline) { isOpen = true; connect(); }
