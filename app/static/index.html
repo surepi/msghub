@@ -4,35 +4,57 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MsgHub 留言汇</title>
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml" sizes="any">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png" sizes="180x180">
 <link rel="stylesheet" href="/static/admin.css">
 </head>
 <body>
 
 <!-- 登录 -->
 <div id="login" class="login hidden">
+  <section class="login-intro">
+    <h1><img class="login-logo" src="/static/logo.png" width="800" height="200" alt="MsgHub 留言汇"></h1>
+    <p class="eyebrow">网站客服工作台</p>
+    <p>留言汇</p>
+  </section>
   <form id="loginForm" class="card login-card">
-    <h1>MsgHub <small>留言汇</small></h1>
-    <p class="muted">网站留言统一管理平台</p>
-    <input type="password" name="password" placeholder="管理密码" required autofocus>
-    <button class="btn primary" type="submit">登录</button>
-    <div class="err" id="loginErr"></div>
+    <img class="login-mobile-logo" src="/static/logo.png" width="800" height="200" alt="MsgHub 留言汇">
+    <p class="eyebrow">欢迎回来</p>
+    <h2>登录工作台</h2>
+    <p class="muted">继续与访客的对话。</p>
+    <label for="adminPassword">管理密码</label>
+    <input id="adminPassword" type="password" name="password" placeholder="请输入管理密码" autocomplete="current-password" required>
+    <button class="btn primary" type="submit">进入工作台 <span aria-hidden="true">→</span></button>
+    <div class="err" id="loginErr" role="alert"></div>
   </form>
 </div>
 
 <!-- 主界面 -->
 <div id="app" class="hidden">
   <header class="top">
-    <div class="brand">MsgHub <small>留言汇</small></div>
-    <nav>
+    <picture class="brand">
+      <source media="(max-width: 520px)" srcset="/static/favicon.svg">
+      <img src="/static/logo.png" width="800" height="200" alt="MsgHub 留言汇">
+    </picture>
+    <nav aria-label="主导航">
       <a href="#chats" data-view="chats">对话 <span id="navUnread" class="nav-badge hidden"></span></a>
       <a href="#messages" data-view="messages">留言</a>
       <a href="#sites" data-view="sites">站点</a>
       <a href="#ai" data-view="ai">AI</a>
+      <a href="#replies" data-view="replies">快捷回复</a>
     </nav>
     <button class="btn ghost" id="logout">退出</button>
   </header>
 
   <main>
+    <div class="page-header">
+      <div>
+        <div class="eyebrow">客服工作台</div>
+        <h2 id="pageTitle">对话</h2>
+        <p id="pageSubtitle">集中处理正在进行的访客会话。</p>
+      </div>
+    </div>
     <section id="stats" class="stats"></section>
 
     <!-- 对话 -->
@@ -40,18 +62,49 @@
       <div class="chat-layout card">
         <aside class="conv-pane">
           <div class="conv-tools">
-            <select id="cStatus">
+            <select id="cStatus" aria-label="会话状态">
               <option value="open">进行中</option>
               <option value="closed">已结束</option>
               <option value="">全部</option>
             </select>
-            <input id="cQ" placeholder="搜索 #编号 / 称呼 / 内容">
+            <input id="cQ" maxlength="200" placeholder="编号、称呼、联系方式、聊天内容" aria-label="搜索会话">
           </div>
+          <details class="conv-filters">
+            <summary>站点与消息日期 <span id="convFilterState"></span></summary>
+            <div class="conv-filter-fields">
+              <label>站点<select id="cSite"><option value="">全部站点</option></select></label>
+              <label>AI 分类<select id="cCategory"><option value="">全部分类</option><option value="sales">售前咨询</option><option value="support">技术支持</option><option value="after_sales">售后服务</option><option value="complaint">投诉</option><option value="refund">退款</option><option value="other">其他</option></select></label>
+              <label>优先级<select id="cPriority"><option value="">全部优先级</option><option value="high">高优先级待处理</option></select></label>
+              <label>开始日期<input id="cFrom" type="date"></label>
+              <label>结束日期<input id="cTo" type="date"></label>
+              <small class="muted">包含起止日期，按服务器时间筛选消息。</small>
+              <button id="clearConvFilters" class="btn sm" type="button">清除筛选</button>
+            </div>
+          </details>
+          <div class="conv-tag-tools">
+            <select id="cTag" aria-label="按标签筛选"><option value="">全部标签</option></select>
+            <button class="btn sm" id="manageTags" type="button">管理标签</button>
+          </div>
+          <div class="conv-selection">
+            <label><input type="checkbox" id="convSelectAll"> 选择本页</label>
+            <span id="convSelectionCount" class="muted" role="status">已选 0 条</span>
+          </div>
+          <form id="tagBatchForm" class="tag-batch hidden">
+            <label class="sr-only" for="batchTag">批量操作的标签</label>
+            <select id="batchTag" required></select>
+            <button class="btn sm" type="submit" name="action" value="add">添加</button>
+            <button class="btn sm" type="submit" name="action" value="remove">移除</button>
+          </form>
           <div id="convList" class="conv-list"></div>
+          <div class="conv-pagination" aria-label="会话分页">
+            <button id="convPrev" type="button" class="btn sm" aria-label="上一页会话">上一页</button>
+            <span id="convPageInfo" role="status"></span>
+            <button id="convNext" type="button" class="btn sm" aria-label="下一页会话">下一页</button>
+          </div>
           <div id="liveState" class="live-state muted">实时连接中…</div>
         </aside>
         <section class="chat-pane" id="chatPane">
-          <div class="chat-empty muted">选择左侧的会话开始回复</div>
+          <div class="chat-empty"><span class="empty-symbol" aria-hidden="true">↗</span><h3>让对话从这里继续</h3><p>选择一条会话，查看访客需求并开始回复。</p></div>
         </section>
       </div>
     </section>
@@ -98,6 +151,9 @@
         <p class="muted">客服不在线、非工作时间，或超过设定时间没回复时，由 AI 根据问答库和网站内容先回答；答不了的转为留言。
           AI 的回复会同步发给客服 QQ，客服回复后 AI 自动退出。</p>
         <label class="row"><input type="checkbox" name="enabled"> 开启 AI 自动应答</label>
+        <label class="row"><input type="checkbox" name="triage_enabled"> 自动分类与 QQ 高优先级提醒</label>
+        <label class="row"><input type="checkbox" name="auto_tags"> 自动添加有原话依据的现有标签（需同时开启自动分类）</label>
+        <p class="muted">这两项默认关闭。开启后处理新访客消息，按会话合并请求；分类与标签由 AI 判断，供核对。手动移除的标签不会被自动加回。</p>
         <div class="grid2">
           <label>接口地址（兼容 OpenAI）<input name="base_url" placeholder="https://api.deepseek.com/v1"></label>
           <label>模型名称<input name="model" placeholder="deepseek-chat"></label>
@@ -129,6 +185,16 @@
       </div>
     </section>
 
+    <section id="view-replies" class="view hidden">
+      <div class="toolbar">
+        <label class="filter-label" for="replyScope">显示</label>
+        <select id="replyScope" aria-label="快捷回复适用站点"></select>
+        <span class="spacer"></span>
+        <button class="btn primary" id="replyNew" type="button">添加快捷回复</button>
+      </div>
+      <div id="quickReplyList" class="quick-replies"></div>
+    </section>
+
     <!-- 站点 -->
     <section id="view-sites" class="view hidden">
       <div id="qqCard" class="card qq-card"></div>
@@ -150,7 +216,57 @@
   </div>
 </div>
 
+<div id="qqDeliveryDrawer" class="drawer hidden">
+  <section class="drawer-panel card qq-delivery-panel" aria-labelledby="qqDeliveryTitle">
+    <div class="drawer-head"><h3 id="qqDeliveryTitle">QQ 投递记录</h3><button class="btn ghost" type="button" data-close aria-label="关闭">✕</button></div>
+    <p class="muted">记录访客消息转发和本次升级后的转人工通知。成功表示 QQ 接受请求或客服人工确认，不代表已读。未配置机器人或未绑定客服时仅保存留言。</p>
+    <div id="qqDeliveryListView">
+      <form id="qqDeliveryFilters" class="toolbar">
+        <select id="qqDeliveryKind" aria-label="投递类型"><option value="">全部类型</option><option value="priority">高优先级提醒</option><option value="handoff">转人工通知</option><option value="visitor">访客消息</option></select>
+        <select id="qqDeliveryStatus" aria-label="投递状态"><option value="">全部状态</option><option value="failed">失败待重试</option><option value="uncertain">结果未确认</option><option value="pending">等待发送</option><option value="sending">发送中</option><option value="sent">已发送</option><option value="cancelled">已取消</option></select>
+        <input id="qqDeliveryConv" type="number" min="1" step="1" placeholder="会话编号" aria-label="按会话编号筛选">
+        <button class="btn sm" type="submit">查询 / 刷新</button>
+      </form>
+      <div id="qqDeliveryList"></div><div id="qqDeliveryPager" class="pager"></div>
+    </div>
+    <div id="qqDeliveryDetail" class="hidden"></div>
+  </section>
+</div>
+
+<div id="triageDrawer" class="drawer hidden">
+  <section class="drawer-panel card qq-delivery-panel" aria-labelledby="triageTitle">
+    <div class="drawer-head"><h3 id="triageTitle">AI 分类与优先级</h3><button class="btn ghost" type="button" data-close aria-label="关闭">✕</button></div>
+    <p class="muted">分类、标签和优先级由 AI 判断，原话匹配不保证语义正确，请核对后处理。自动运行可在 AI 设置中开启；查看或手动分析不会发送 QQ 提醒。</p>
+    <div id="triageBody"></div>
+  </section>
+</div>
+
+<div id="summaryDrawer" class="drawer hidden">
+  <section class="drawer-panel card qq-delivery-panel" aria-labelledby="summaryTitle">
+    <div class="drawer-head"><h3 id="summaryTitle">AI 会话总结</h3><button class="btn ghost" type="button" data-close aria-label="关闭">✕</button></div>
+    <p class="muted">总结与需求由 AI 生成，供客服核对。联系方式附访客原话，不会自动写入访客资料。转人工时自动生成，也可通过 QQ /总结 #编号 更新。</p>
+    <div id="summaryBody"></div>
+  </section>
+</div>
+
+<div id="aiDecisionDrawer" class="drawer hidden">
+  <section class="drawer-panel card qq-delivery-panel" aria-labelledby="aiDecisionTitle">
+    <div class="drawer-head"><h3 id="aiDecisionTitle">AI 参考资料与处理依据</h3><button class="btn ghost" type="button" data-close aria-label="关闭">✕</button></div>
+    <p class="muted">保存处理当时的资料快照。参考资料是本次提供给模型的内容，客服仍需核对回答；模型返回的转人工分类会单独标明。旧消息不会补建记录。</p>
+    <div id="aiDecisionBody"></div>
+  </section>
+</div>
+
 <!-- 站点编辑 -->
+<div id="relatedDrawer" class="drawer hidden">
+  <section class="drawer-panel card" aria-labelledby="relatedTitle">
+    <div class="drawer-head"><h3 id="relatedTitle">关联留言</h3><button class="btn ghost" type="button" data-close aria-label="关闭">✕</button></div>
+    <p class="muted">查看会话转成的留言。留言处理状态与会话状态分别保存。</p>
+    <div id="relatedList"></div>
+    <div id="relatedPager" class="pager"></div>
+  </section>
+</div>
+
 <div id="siteModal" class="drawer hidden">
   <form class="drawer-panel card" id="siteForm">
     <div class="drawer-head"><h3 id="siteModalTitle">新建站点</h3><button type="button" class="btn ghost" data-close>✕</button></div>
@@ -207,7 +323,30 @@
   </form>
 </div>
 
-<div id="toast" class="toast hidden"></div>
+<div id="quickReplyModal" class="drawer hidden">
+  <form class="drawer-panel card" id="quickReplyForm">
+    <div class="drawer-head"><h3 id="quickReplyModalTitle">添加快捷回复</h3><button type="button" class="btn ghost" data-close aria-label="关闭">✕</button></div>
+    <label>名称 *<input name="title" required maxlength="80" placeholder="例如：工作时间"></label>
+    <label>适用范围<select name="site_id"></select></label>
+    <label>回复内容 *<textarea name="content" required rows="7" maxlength="2000" placeholder="输入客服常用回复"></textarea></label>
+    <button class="btn primary" type="submit">保存快捷回复</button>
+  </form>
+</div>
+
+<div id="tagManager" class="drawer hidden">
+  <section class="drawer-panel card" aria-labelledby="tagManagerTitle">
+    <div class="drawer-head"><h3 id="tagManagerTitle">会话标签</h3><button type="button" class="btn ghost" data-close aria-label="关闭">✕</button></div>
+    <p class="muted">标签在所有站点共用，仅客服可见。删除标签会移除会话上的关联，保留聊天记录。</p>
+    <form id="tagCreateForm" class="tag-create">
+      <label class="sr-only" for="newTagName">新标签名称</label>
+      <input id="newTagName" name="name" required maxlength="30" placeholder="新标签名称，最多 30 字">
+      <button class="btn primary" type="submit">添加</button>
+    </form>
+    <div id="tagCatalog"></div>
+  </section>
+</div>
+
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 <script src="/static/admin.js"></script>
 </body>
 </html>

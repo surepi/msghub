@@ -13,10 +13,10 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import auth, auto, chat, media, qq
+from . import auth, auto, chat, media, qq, qq_delivery, summaries, triage
 from .common import RateLimiter, origin_allowed, parse_work_hours
 from .config import MAX_CONTACT, MAX_CONTENT, MAX_NAME, RATE_LIMIT_PER_MIN
-from .db import STATUSES, get_db, init_db, rows
+from .db import ADMIN_MESSAGE_SQL, STATUSES, get_db, init_db, rows
 
 STATIC = Path(__file__).parent / "static"
 
@@ -31,7 +31,7 @@ async def cache_headers(request: Request, call_next):
     path = request.url.path
     if path.startswith("/uploads/"):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-    elif path == "/" or path == "/embed.js" or path.startswith("/static/"):
+    elif path in ("/", "/embed.js", "/favicon.ico") or path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -41,7 +41,10 @@ app.mount("/uploads", StaticFiles(directory=media.UPLOAD_DIR), name="uploads")
 app.include_router(chat.router)
 app.include_router(media.router)
 app.include_router(qq.router)
+app.include_router(qq_delivery.router)
 app.include_router(auto.router)
+app.include_router(summaries.router)
+app.include_router(triage.router)
 
 
 @app.on_event("startup")
@@ -49,6 +52,7 @@ async def _startup():
     init_db()
     qq.setup()     # 先注册 QQ 转发，再注册 AI / 转留言
     auto.setup()
+    triage.setup()
 
 
 @app.get("/api/health")
@@ -73,6 +77,11 @@ def index(request: Request):
 @app.get("/embed.js", include_in_schema=False)
 def embed_js(request: Request):
     return _file(request, STATIC / "embed.js", "application/javascript")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon(request: Request):
+    return _file(request, STATIC / "favicon.ico", "image/vnd.microsoft.icon")
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +191,8 @@ async def public_submit(request: Request, bg: BackgroundTasks):
             msg,
         )
         msg["id"] = cur.lastrowid
+
+    await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": []})
 
     if site["webhook_url"]:
         bg.add_task(_push_webhook, site["webhook_url"], {"event": "message.created", "site": site["name"], **msg})
@@ -345,7 +356,7 @@ def list_messages(site_id: int | None = None, status: str | None = None, q: str 
     with get_db() as db:
         total = db.execute(f"SELECT COUNT(*) FROM messages m {where}", args).fetchone()[0]
         items = rows(db.execute(
-            f"SELECT m.*, s.name AS site_name FROM messages m JOIN sites s ON s.id = m.site_id {where} "
+            ADMIN_MESSAGE_SQL + f"{where} "
             f"ORDER BY m.id DESC LIMIT ? OFFSET ?",
             [*args, size, (page - 1) * size],
         ))
@@ -357,8 +368,21 @@ class MsgPatch(BaseModel):
     note: str | None = None
 
 
+@app.post("/api/admin/messages/{msg_id}/read", tags=["留言"], dependencies=[admin])
+async def mark_message_read(msg_id: int):
+    with get_db() as db:
+        message = db.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
+        if not message:
+            raise HTTPException(404, "留言不存在")
+        changed = db.execute("UPDATE messages SET status = 'read', updated_at = datetime('now','localtime') WHERE id = ? AND status = 'new'", (msg_id,)).rowcount
+        current = db.execute("SELECT status FROM messages WHERE id = ?", (msg_id,)).fetchone()[0]
+    if changed:
+        await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": [message[0]] if message[0] else []})
+    return {"ok": True, "status": current}
+
+
 @app.patch("/api/admin/messages/{msg_id}", tags=["留言"], dependencies=[admin])
-def patch_message(msg_id: int, body: MsgPatch):
+async def patch_message(msg_id: int, body: MsgPatch):
     sets, args = [], []
     if body.status is not None:
         if body.status not in STATUSES:
@@ -370,8 +394,10 @@ def patch_message(msg_id: int, body: MsgPatch):
         return {"ok": True}
     sets.append("updated_at=datetime('now','localtime')")
     with get_db() as db:
+        source = db.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
         if not db.execute(f"UPDATE messages SET {', '.join(sets)} WHERE id=?", [*args, msg_id]).rowcount:
             raise HTTPException(404, "留言不存在")
+    await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": [source[0]] if source[0] else []})
     return {"ok": True}
 
 
@@ -381,11 +407,12 @@ class BatchIn(BaseModel):
 
 
 @app.post("/api/admin/messages/batch", tags=["留言"], dependencies=[admin])
-def batch_messages(body: BatchIn):
+async def batch_messages(body: BatchIn):
     if not body.ids:
         return {"ok": True, "affected": 0}
     marks = ",".join("?" * len(body.ids))
     with get_db() as db:
+        source_ids = [r[0] for r in db.execute(f"SELECT DISTINCT conversation_id FROM messages WHERE id IN ({marks}) AND conversation_id IS NOT NULL", body.ids)]
         if body.action == "delete":
             n = db.execute(f"DELETE FROM messages WHERE id IN ({marks})", body.ids).rowcount
         elif body.action in STATUSES:
@@ -395,13 +422,16 @@ def batch_messages(body: BatchIn):
             ).rowcount
         else:
             raise HTTPException(400, "操作无效")
+    await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": source_ids})
     return {"ok": True, "affected": n}
 
 
 @app.delete("/api/admin/messages/{msg_id}", tags=["留言"], dependencies=[admin])
-def delete_message(msg_id: int):
+async def delete_message(msg_id: int):
     with get_db() as db:
+        source = db.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
         db.execute("DELETE FROM messages WHERE id=?", (msg_id,))
+    await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": [source[0]] if source and source[0] else []})
     return {"ok": True}
 
 
@@ -422,3 +452,12 @@ def export_csv(site_id: int | None = None, status: str | None = None, q: str | N
     buf.seek(0)
     return StreamingResponse(buf, media_type="text/csv; charset=utf-8",
                              headers={"Content-Disposition": "attachment; filename=messages.csv"})
+
+
+@app.get("/api/admin/messages/{msg_id}", tags=["留言"], dependencies=[admin])
+def get_message(msg_id: int):
+    with get_db() as db:
+        message = db.execute(ADMIN_MESSAGE_SQL + "WHERE m.id = ?", (msg_id,)).fetchone()
+    if not message:
+        raise HTTPException(404, "留言不存在")
+    return dict(message)

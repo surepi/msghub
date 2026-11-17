@@ -25,17 +25,20 @@
 """
 import asyncio
 import secrets
+import sqlite3
 from collections import defaultdict
-from typing import Awaitable, Callable
+from contextlib import nullcontext
+from datetime import date
+from typing import Awaitable, Callable, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
 
 from . import auth, media
 from .common import (DEFAULT_OFFLINE, DEFAULT_WELCOME, RateLimiter, in_work_hours, origin_allowed,
                      valid_contact)
 from .config import MAX_CONTACT, MAX_CONTENT, MAX_NAME
-from .db import get_db, rows
+from .db import ADMIN_MESSAGE_SQL, get_db, rows
 
 router = APIRouter()
 admin = Depends(auth.require_admin)
@@ -139,12 +142,31 @@ def preview_of(msg_type: str, content: str) -> str:
     return "[图片]" if msg_type == "image" else content.replace("\n", " ")[:80]
 
 
+def _attach_tags(db, conversations: list[dict]):
+    """Only used for admin summaries, never for the visitor protocol."""
+    if not conversations:
+        return
+    from .triage import attach
+    attach(db, conversations)
+    by_id = {c["id"]: c for c in conversations}
+    for c in conversations:
+        c["tags"] = []
+    marks = ",".join("?" for _ in by_id)
+    for tag in db.execute(
+        "SELECT ct.conversation_id, t.id, t.name FROM conversation_tags ct "
+        f"JOIN tags t ON t.id = ct.tag_id WHERE ct.conversation_id IN ({marks}) ORDER BY t.name, t.id",
+        list(by_id),
+    ):
+        by_id[tag["conversation_id"]]["tags"].append({"id": tag["id"], "name": tag["name"]})
+
+
 def conv_summary(conv_id: int) -> dict | None:
     with get_db() as db:
         r = db.execute(CONV_SUMMARY_SQL + "WHERE c.id = ?", (conv_id,)).fetchone()
-    if not r:
-        return None
-    d = dict(r)
+        if not r:
+            return None
+        d = dict(r)
+        _attach_tags(db, [d])
     d["visitor_online"] = hub.visitor_online(conv_id)
     return d
 
@@ -209,11 +231,11 @@ def history(conv_id: int, limit: int = HISTORY_LIMIT) -> list[dict]:
     return [_msg_out(m) for m in items]
 
 
-def add_message(conv_id: int, sender: str, content: str, page_url: str = "", msg_type: str = "text") -> dict:
+def add_message(conv_id: int, sender: str, content: str, page_url: str = "", msg_type: str = "text", *, db=None) -> dict:
     """写入一条消息并更新会话状态：
     访客消息 → 未读 +1，已结束的会话重新打开为 waiting；
     客服消息 → 未读清零，会话变为 active；AI / 系统消息不改状态。"""
-    with get_db() as db:
+    with (get_db() if db is None else nullcontext(db)) as db:
         cur = db.execute(
             "INSERT INTO chat_messages (conversation_id, sender, content, msg_type) VALUES (?,?,?,?)",
             (conv_id, sender, content, msg_type),
@@ -456,10 +478,31 @@ async def admin_ws(ws: WebSocket):
 # ---------------------------------------------------------------------------
 
 @router.get("/api/admin/conversations", tags=["对话"], dependencies=[admin])
-def list_conversations(status: str | None = None, site_id: int | None = None, q: str | None = None,
-                       page: int = 1, size: int = 30):
+def list_conversations(status: str | None = None, site_id: int | None = None,
+                       q: str = Query(default="", max_length=200), page: int = 1, size: int = 30,
+                       tag_id: int | None = Query(default=None, gt=0),
+                       date_from: date | None = None, date_to: date | None = None,
+                       category: str | None = None, priority: str | None = None):
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(400, "开始日期不能晚于结束日期")
     size = max(1, min(size, 100))
     page = max(1, page)
+    q = q.strip()
+    # Treat wildcard characters as ordinary search text, and keep SQLite's ASCII case folding.
+    pattern = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    msg_where, msg_args = ["m.conversation_id = c.id"], []
+    if date_from:
+        msg_where.append("m.created_at >= ?")
+        msg_args.append(date_from.isoformat() + " 00:00:00")
+    if date_to:
+        msg_where.append("m.created_at <= ?")
+        msg_args.append(date_to.isoformat() + " 23:59:59")
+    period_where = " AND ".join(msg_where)
+    period_args = list(msg_args)
+    if q:
+        msg_where.extend(["m.msg_type = 'text'", "m.content LIKE ? ESCAPE '\\'"])
+        msg_args.append(pattern)
+    match_where = " AND ".join(msg_where)
     where, args = [], []
     if status == "open":
         where.append("c.status != 'closed'")
@@ -467,25 +510,112 @@ def list_conversations(status: str | None = None, site_id: int | None = None, q:
         where.append("c.status = ?"); args.append(status)
     if site_id:
         where.append("c.site_id = ?"); args.append(site_id)
+    if tag_id is not None:
+        where.append("EXISTS (SELECT 1 FROM conversation_tags ct WHERE ct.conversation_id = c.id AND ct.tag_id = ?)")
+        args.append(tag_id)
+    from .triage import CATEGORIES
+    if category:
+        if category not in CATEGORIES:
+            raise HTTPException(400,'分类无效')
+        where.append("(SELECT t.category FROM conversation_triage t WHERE t.conversation_id=c.id AND t.status='ready' ORDER BY t.source_upto DESC LIMIT 1)=?")
+        args.append(category)
+    if priority:
+        if priority != 'high':
+            raise HTTPException(400,'优先级无效')
+        where.append("c.status!='closed' AND EXISTS (SELECT 1 FROM conversation_triage t WHERE t.conversation_id=c.id AND t.status='ready' AND t.priority='high' AND t.dismissed=0 AND t.source_upto=(SELECT MAX(t2.source_upto) FROM conversation_triage t2 WHERE t2.conversation_id=c.id AND t2.status='ready') AND t.source_upto>COALESCE((SELECT MAX(m.id) FROM chat_messages m WHERE m.conversation_id=c.id AND m.sender='agent'),0))")
+    if date_from or date_to:
+        where.append(f"EXISTS (SELECT 1 FROM chat_messages m WHERE {period_where})")
+        args.extend(period_args)
     if q:
-        q = q.strip().lstrip("#")
-        cond = "(v.name LIKE ? OR v.contact LIKE ? OR c.last_preview LIKE ?"
-        args += [f"%{q}%"] * 3
-        if q.isdigit():
-            cond += " OR c.id = ?"; args.append(int(q))
+        cond = f"(v.name LIKE ? ESCAPE '\\' OR v.contact LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM chat_messages m WHERE {match_where})"
+        args.extend([pattern, pattern, *msg_args])
+        number = q.removeprefix("#")
+        if number.isascii() and number.isdigit() and int(number) <= 9223372036854775807:
+            cond += " OR c.id = ?"; args.append(int(number))
         where.append(cond + ")")
     w = ("WHERE " + " AND ".join(where)) if where else ""
+    summary_sql, select_args = CONV_SUMMARY_SQL, []
+    if q or date_from or date_to:
+        summary_sql = summary_sql.replace("SELECT c.*", f"SELECT (SELECT m.id FROM chat_messages m WHERE {match_where} ORDER BY m.id DESC LIMIT 1) AS match_id, c.*", 1)
+        select_args = msg_args
     with get_db() as db:
         total = db.execute(
             f"SELECT COUNT(*) FROM conversations c JOIN visitors v ON v.id = c.visitor_id {w}", args
         ).fetchone()[0]
         items = rows(db.execute(
-            CONV_SUMMARY_SQL + f"{w} ORDER BY c.last_msg_at DESC, c.id DESC LIMIT ? OFFSET ?",
-            [*args, size, (page - 1) * size],
+            summary_sql + f"{w} ORDER BY c.last_msg_at DESC, c.id DESC LIMIT ? OFFSET ?",
+            [*select_args, *args, size, (page - 1) * size],
         ))
+        _attach_tags(db, items)
+        match_ids = [it["match_id"] for it in items if it.get("match_id")]
+        matches = {}
+        if match_ids:
+            marks = ",".join("?" for _ in match_ids)
+            matches = {m["id"]: dict(m) for m in db.execute(
+                f"SELECT id, content, sender, msg_type, created_at FROM chat_messages WHERE id IN ({marks})", match_ids)}
+        for it in items:
+            match = matches.get(it.pop("match_id", None))
+            it["search_match"] = None
+            if match:
+                text = "[图片]" if match["msg_type"] == "image" else match["content"]
+                start = max(0, text.lower().find(q.lower()) - 35) if q else 0
+                snippet = ("…" if start else "") + text[start:start + 160] + ("…" if start + 160 < len(text) else "")
+                it["search_match"] = {"id": match["id"], "sender": match["sender"],
+                                      "created_at": match["created_at"], "snippet": snippet}
     for it in items:
         it["visitor_online"] = hub.visitor_online(it["id"])
     return {"total": total, "page": page, "size": size, "items": items}
+
+
+def _message_page(db, conv_id: int, *, before_id: int | None = None, after_id: int | None = None,
+                  around_id: int | None = None, limit: int = 100) -> dict:
+    anchors = [i for i in (before_id, after_id, around_id) if i is not None]
+    if len(anchors) > 1:
+        raise HTTPException(400, "只能指定一个消息定位参数")
+    if anchors and not db.execute("SELECT 1 FROM chat_messages WHERE id = ? AND conversation_id = ?",
+                                  (anchors[0], conv_id)).fetchone():
+        raise HTTPException(404, "消息不存在或不属于此会话")
+    if around_id is not None:
+        before = rows(db.execute("SELECT * FROM chat_messages WHERE conversation_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+                                 (conv_id, around_id, limit // 2)))
+        after = rows(db.execute("SELECT * FROM chat_messages WHERE conversation_id = ? AND id >= ? ORDER BY id LIMIT ?",
+                                (conv_id, around_id, limit - limit // 2)))
+        items = list(reversed(before)) + after
+    elif after_id is not None:
+        items = rows(db.execute("SELECT * FROM chat_messages WHERE conversation_id = ? AND id > ? ORDER BY id LIMIT ?",
+                                (conv_id, after_id, limit)))
+    else:
+        clause = " AND id < ?" if before_id is not None else ""
+        args = [conv_id, before_id, limit] if before_id is not None else [conv_id, limit]
+        items = list(reversed(rows(db.execute(
+            f"SELECT * FROM chat_messages WHERE conversation_id = ?{clause} ORDER BY id DESC LIMIT ?", args))))
+    first = items[0]["id"] if items else anchors[0] if anchors else 0
+    last = items[-1]["id"] if items else first
+    return {"items": [_msg_out(m) for m in items],
+            "has_older": bool(db.execute("SELECT 1 FROM chat_messages WHERE conversation_id = ? AND id < ? LIMIT 1", (conv_id, first)).fetchone()),
+            "has_newer": bool(db.execute("SELECT 1 FROM chat_messages WHERE conversation_id = ? AND id > ? LIMIT 1", (conv_id, last)).fetchone())}
+
+
+@router.get("/api/admin/conversations/{conv_id}/messages", tags=["对话"], dependencies=[admin])
+def get_admin_messages(conv_id: int, before_id: int | None = Query(default=None, gt=0),
+                       after_id: int | None = Query(default=None, gt=0),
+                       around_id: int | None = Query(default=None, gt=0),
+                       limit: int = Query(default=100, ge=1, le=500)):
+    _require_conv(conv_id)
+    with get_db() as db:
+        return _message_page(db, conv_id, before_id=before_id, after_id=after_id, around_id=around_id, limit=limit)
+
+
+@router.get("/api/admin/conversations/{conv_id}/inbox-messages", tags=["留言"], dependencies=[admin])
+def conversation_inbox_messages(conv_id: int, page: int = Query(default=1, ge=1),
+                                size: int = Query(default=10, ge=1, le=100)):
+    conv = _require_conv(conv_id)
+    with get_db() as db:
+        args = (conv_id, conv["site_id"])
+        total = db.execute("SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND site_id = ?", args).fetchone()[0]
+        items = rows(db.execute(ADMIN_MESSAGE_SQL + "WHERE m.conversation_id = ? AND m.site_id = ? ORDER BY m.id DESC LIMIT ? OFFSET ?",
+                                (*args, size, (page - 1) * size)))
+    return {"items": items, "total": total, "page": page, "size": size}
 
 
 def _require_conv(conv_id: int) -> dict:
@@ -495,20 +625,233 @@ def _require_conv(conv_id: int) -> dict:
     return conv
 
 
+class TagIn(BaseModel):
+    name: str
+
+
+def _tag_name(body: TagIn) -> str:
+    name = body.name.strip()
+    if not name or len(name) > 30:
+        raise HTTPException(400, "标签名称需要 1–30 字")
+    return name
+
+
+@router.get("/api/admin/tags", tags=["标签"], dependencies=[admin])
+def list_tags():
+    with get_db() as db:
+        return rows(db.execute(
+            "SELECT t.id, t.name, COUNT(ct.conversation_id) AS conversation_count FROM tags t "
+            "LEFT JOIN conversation_tags ct ON ct.tag_id = t.id GROUP BY t.id ORDER BY t.id"
+        ))
+
+
+@router.post("/api/admin/tags", tags=["标签"], dependencies=[admin])
+async def create_tag(body: TagIn):
+    name = _tag_name(body)
+    try:
+        with get_db() as db:
+            cur = db.execute("INSERT INTO tags (name) VALUES (?)", (name,))
+            tag = {"id": cur.lastrowid, "name": name, "conversation_count": 0}
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "已存在同名标签")
+    await hub.to_admins({"type": "tags_changed"})
+    return tag
+
+
+@router.put("/api/admin/tags/{tag_id}", tags=["标签"], dependencies=[admin])
+async def rename_tag(tag_id: int, body: TagIn):
+    name = _tag_name(body)
+    try:
+        with get_db() as db:
+            if not db.execute("UPDATE tags SET name = ? WHERE id = ?", (name, tag_id)).rowcount:
+                raise HTTPException(404, "标签不存在")
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "已存在同名标签")
+    await hub.to_admins({"type": "tags_changed"})
+    return {"ok": True}
+
+
+@router.delete("/api/admin/tags/{tag_id}", tags=["标签"], dependencies=[admin])
+async def delete_tag(tag_id: int):
+    with get_db() as db:
+        if not db.execute("DELETE FROM tags WHERE id = ?", (tag_id,)).rowcount:
+            raise HTTPException(404, "标签不存在")
+    await hub.to_admins({"type": "tags_changed"})
+    return {"ok": True}
+
+
+class TagBatchIn(BaseModel):
+    conversation_ids: list[int] = Field(min_length=1, max_length=100)
+    tag_id: int = Field(gt=0)
+    action: Literal["add", "remove"]
+
+
+async def _change_tags(conv_ids: list[int], tag_id: int, action: str) -> list[dict]:
+    conv_ids = list(dict.fromkeys(conv_ids))
+    marks = ",".join("?" for _ in conv_ids)
+    with get_db() as db:
+        # Validate and mutate in one transaction; invalid batches must change nothing.
+        db.execute("BEGIN IMMEDIATE")
+        if not db.execute("SELECT 1 FROM tags WHERE id = ?", (tag_id,)).fetchone():
+            raise HTTPException(404, "标签不存在")
+        count = db.execute(f"SELECT COUNT(*) FROM conversations WHERE id IN ({marks})", conv_ids).fetchone()[0]
+        if count != len(conv_ids):
+            raise HTTPException(404, "部分会话已不存在，请刷新后重试")
+        if action == "add":
+            db.executemany("DELETE FROM conversation_ai_tag_blocks WHERE conversation_id=? AND tag_id=?", [(cid,tag_id) for cid in conv_ids])
+            db.executemany("INSERT OR IGNORE INTO conversation_tags (conversation_id, tag_id) VALUES (?, ?)",
+                           [(cid, tag_id) for cid in conv_ids])
+        else:
+            db.executemany("INSERT OR IGNORE INTO conversation_ai_tag_blocks (conversation_id,tag_id) VALUES (?,?)", [(cid,tag_id) for cid in conv_ids])
+            db.executemany("DELETE FROM conversation_tags WHERE conversation_id = ? AND tag_id = ?",
+                           [(cid, tag_id) for cid in conv_ids])
+        conversations = rows(db.execute(CONV_SUMMARY_SQL + f"WHERE c.id IN ({marks})", conv_ids))
+        _attach_tags(db, conversations)
+    for c in conversations:
+        c["visitor_online"] = hub.visitor_online(c["id"])
+        await hub.to_admins({"type": "conv", "conversation": c})
+    return conversations
+
+
+@router.post("/api/admin/conversation-tags/batch", tags=["标签"], dependencies=[admin])
+async def batch_tags(body: TagBatchIn):
+    conversations = await _change_tags(body.conversation_ids, body.tag_id, body.action)
+    return {"ok": True, "affected": len(conversations), "conversations": conversations}
+
+
+@router.get("/api/admin/conversations/{conv_id}/tags", tags=["标签"], dependencies=[admin])
+def get_conversation_tags(conv_id: int):
+    return {"tags": _require_conv(conv_id)["tags"]}
+
+
+@router.put("/api/admin/conversations/{conv_id}/tags/{tag_id}", tags=["标签"], dependencies=[admin])
+async def add_tag_to_conversation(conv_id: int, tag_id: int):
+    return {"conversation": (await _change_tags([conv_id], tag_id, "add"))[0]}
+
+
+@router.delete("/api/admin/conversations/{conv_id}/tags/{tag_id}", tags=["标签"], dependencies=[admin])
+async def remove_tag_from_conversation(conv_id: int, tag_id: int):
+    return {"conversation": (await _change_tags([conv_id], tag_id, "remove"))[0]}
+
+
 @router.get("/api/admin/conversations/{conv_id}", tags=["对话"], dependencies=[admin])
-async def get_conversation(conv_id: int):
+async def get_conversation(conv_id: int, message_id: int | None = Query(default=None, gt=0)):
     conv = _require_conv(conv_id)
     with get_db() as db:
+        window = _message_page(db, conv_id, around_id=message_id, limit=100 if message_id else 500)
         visitor = dict(db.execute(
             "SELECT id, name, contact, ip, user_agent, first_page, created_at, last_seen_at FROM visitors WHERE id = ?",
             (conv["visitor_id"],),
         ).fetchone())
+        notes = rows(db.execute(
+            "SELECT id, content, created_at FROM conversation_notes WHERE conversation_id = ? ORDER BY id DESC LIMIT 100",
+            (conv_id,),
+        ))
         if conv["unread"]:
             db.execute("UPDATE conversations SET unread = 0 WHERE id = ?", (conv_id,))
     if conv["unread"]:
         conv = _require_conv(conv_id)
         await hub.to_admins({"type": "conv", "conversation": conv})
-    return {"conversation": conv, "visitor": visitor, "messages": history(conv_id, 500)}
+    return {"conversation": conv, "visitor": visitor, "messages": window["items"], "notes": notes,
+            "has_older": window["has_older"], "has_newer": window["has_newer"]}
+
+
+class InternalNoteIn(BaseModel):
+    content: str
+
+
+@router.post("/api/admin/conversations/{conv_id}/notes", tags=["对话"], dependencies=[admin])
+def add_conversation_note(conv_id: int, body: InternalNoteIn):
+    _require_conv(conv_id)
+    content = body.content.strip()
+    if not content:
+        raise HTTPException(400, "备注不能为空")
+    if len(content) > 2000:
+        raise HTTPException(400, "备注不能超过 2000 字")
+    with get_db() as db:
+        cur = db.execute(
+            "INSERT INTO conversation_notes (conversation_id, content) VALUES (?, ?)",
+            (conv_id, content),
+        )
+        note = dict(db.execute(
+            "SELECT id, content, created_at FROM conversation_notes WHERE id = ?",
+            (cur.lastrowid,),
+        ).fetchone())
+    return {"note": note}
+
+
+class QuickReplyIn(BaseModel):
+    title: str
+    content: str
+    site_id: int | None = Field(default=None, gt=0)
+
+
+def _quick_reply_values(body: QuickReplyIn) -> tuple[int | None, str, str]:
+    title, content = body.title.strip(), body.content.strip()
+    if not title:
+        raise HTTPException(400, "快捷回复名称不能为空")
+    if not content:
+        raise HTTPException(400, "快捷回复内容不能为空")
+    if len(title) > 80 or len(content) > 2000:
+        raise HTTPException(400, "名称最多 80 字，内容最多 2000 字")
+    return body.site_id, title, content
+
+
+@router.get("/api/admin/quick-replies", tags=["对话"], dependencies=[admin])
+def list_quick_replies(site_id: int | None = Query(default=None, gt=0)):
+    with get_db() as db:
+        if site_id is not None:
+            return rows(db.execute(
+                "SELECT q.*, s.name AS site_name FROM quick_replies q "
+                "LEFT JOIN sites s ON s.id = q.site_id WHERE q.site_id IS NULL OR q.site_id = ? "
+                "ORDER BY q.site_id IS NOT NULL, q.title COLLATE NOCASE, q.id",
+                (site_id,),
+            ))
+        return rows(db.execute(
+            "SELECT q.*, s.name AS site_name FROM quick_replies q "
+            "LEFT JOIN sites s ON s.id = q.site_id ORDER BY q.site_id IS NOT NULL, q.title COLLATE NOCASE, q.id"
+        ))
+
+
+@router.post("/api/admin/quick-replies", tags=["对话"], dependencies=[admin])
+def create_quick_reply(body: QuickReplyIn):
+    site_id, title, content = _quick_reply_values(body)
+    with get_db() as db:
+        if site_id is not None and not db.execute("SELECT 1 FROM sites WHERE id = ?", (site_id,)).fetchone():
+            raise HTTPException(404, "站点不存在")
+        cur = db.execute(
+            "INSERT INTO quick_replies (site_id, title, content) VALUES (?, ?, ?)",
+            (site_id, title, content),
+        )
+        return dict(db.execute(
+            "SELECT q.*, s.name AS site_name FROM quick_replies q "
+            "LEFT JOIN sites s ON s.id = q.site_id WHERE q.id = ?",
+            (cur.lastrowid,),
+        ).fetchone())
+
+
+@router.put("/api/admin/quick-replies/{reply_id}", tags=["对话"], dependencies=[admin])
+def update_quick_reply(reply_id: int, body: QuickReplyIn):
+    site_id, title, content = _quick_reply_values(body)
+    with get_db() as db:
+        if site_id is not None and not db.execute("SELECT 1 FROM sites WHERE id = ?", (site_id,)).fetchone():
+            raise HTTPException(404, "站点不存在")
+        cur = db.execute(
+            "UPDATE quick_replies SET site_id = ?, title = ?, content = ?, updated_at = datetime('now','localtime') "
+            "WHERE id = ?",
+            (site_id, title, content, reply_id),
+        )
+        if not cur.rowcount:
+            raise HTTPException(404, "快捷回复不存在")
+    return {"ok": True}
+
+
+@router.delete("/api/admin/quick-replies/{reply_id}", tags=["对话"], dependencies=[admin])
+def delete_quick_reply(reply_id: int):
+    with get_db() as db:
+        if not db.execute("DELETE FROM quick_replies WHERE id = ?", (reply_id,)).rowcount:
+            raise HTTPException(404, "快捷回复不存在")
+    return {"ok": True}
 
 
 @router.post("/api/admin/conversations/{conv_id}/read", tags=["对话"], dependencies=[admin])

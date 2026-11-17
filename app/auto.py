@@ -17,13 +17,14 @@ import urllib.parse
 import urllib.request
 import urllib.robotparser
 from collections import defaultdict
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from . import auth, chat
-from .common import DEFAULT_OFFLINE
+from .common import DEFAULT_OFFLINE, in_work_hours
 from .db import get_db, get_setting, rows, set_settings
 
 router = APIRouter()
@@ -61,6 +62,8 @@ notify_agent = _no_notify
 def ai_settings() -> dict:
     return {
         "enabled": get_setting("ai_enabled", "0") == "1",
+        "triage_enabled": get_setting("ai_triage_enabled", "0") == "1",
+        "auto_tags": get_setting("ai_auto_tags", "0") == "1",
         "base_url": get_setting("ai_base_url", ""),
         "api_key": get_setting("ai_api_key", ""),
         "model": get_setting("ai_model", ""),
@@ -83,33 +86,46 @@ def _grams(text: str) -> set[str]:
     return {s[i:i + 2] for i in range(len(s) - 1)} | set(re.findall(r"[a-z0-9]{2,}", s))
 
 
-def retrieve(site_id: int, query: str, limit_chars: int = 3500) -> str:
+def retrieve_sources(site_id: int, query: str, limit_chars: int = 3500) -> tuple[str, list[dict]]:
     q = _grams(query)
     if not q:
-        return ""
+        return "", []
     with get_db() as db:
-        qa = rows(db.execute("SELECT question, answer FROM qa WHERE site_id IS NULL OR site_id = ?", (site_id,)))
-        pages = rows(db.execute("SELECT url, title, text FROM kb_pages WHERE site_id = ?", (site_id,)))
+        qa = rows(db.execute("SELECT id,site_id,question,answer FROM qa WHERE site_id IS NULL OR site_id = ? ORDER BY id", (site_id,)))
+        pages = rows(db.execute("SELECT url,title,text,fetched_at FROM kb_pages WHERE site_id = ? ORDER BY url", (site_id,)))
     scored = []
     for item in qa:
         s = 2 * len(q & _grams(item["question"])) + len(q & _grams(item["answer"]))
         if s:
-            scored.append((s + 3, f"问：{item['question']}\n答：{item['answer']}"))   # 问答库优先
+            scored.append((s + 3, f"问：{item['question']}\n答：{item['answer']}",
+                           {'type':'qa','id':item['id'],'site_id':item['site_id'],'title':item['question'][:200],
+                            'url':'','scope':'全局' if item['site_id'] is None else '本站'}))
     for p in pages:
         t = p["text"]
         for i in range(0, len(t), CHUNK):
             chunk = t[max(0, i - 50):i + CHUNK]
             s = len(q & _grams(chunk))
             if s >= 2:
-                scored.append((s, f"（网页：{p['title'] or p['url']}）{chunk}"))
+                scored.append((s, f"（网页：{p['title'] or p['url']}）{chunk}",
+                               {'type':'page','site_id':site_id,'title':(p['title'] or p['url'])[:200],
+                                'url':p['url'],'fetched_at':p['fetched_at'],'offset':max(0,i-50),'scope':'本站'}))
     scored.sort(key=lambda x: -x[0])
-    out, used = [], 0
-    for _, text in scored[:8]:
-        if used + len(text) > limit_chars:
+    out, sources, used = [], [], 0
+    for score, text, source in scored[:8]:
+        prefix = f'[资料{len(sources)+1}] '
+        remaining = limit_chars - used - (2 if out else 0) - len(prefix)
+        if remaining < 20:
             break
-        out.append(text)
-        used += len(text)
-    return "\n\n".join(out)
+        snippet = text[:remaining]
+        part = prefix + snippet
+        sources.append({**source,'ref':len(sources)+1,'score':score,'snippet':snippet,'truncated':len(snippet)<len(text)})
+        used += len(part) + (2 if out else 0)
+        out.append(part)
+    return '\n\n'.join(out), sources
+
+
+def retrieve(site_id: int, query: str, limit_chars: int = 3500) -> str:
+    return retrieve_sources(site_id, query, limit_chars)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +133,43 @@ def retrieve(site_id: int, query: str, limit_chars: int = 3500) -> str:
 # ---------------------------------------------------------------------------
 
 class AIError(Exception):
-    pass
+    evidence = None
+
+
+REASONS = {
+    'answered':'AI 已回答', 'insufficient_sources':'模型判断资料不足',
+    'visitor_requested':'模型判断访客要求人工', 'human_required':'模型判断需人工办理',
+    'model_handoff':'AI 判断需要人工处理（未提供具体分类）',
+    'api_error':'AI 服务暂不可用', 'empty_answer':'AI 未返回有效回答',
+    'disabled':'AI 自动应答未启用', 'unconfigured':'AI 自动应答配置未完成',
+}
+HANDOFF_CODES = {'资料不足':'insufficient_sources','访客要求':'visitor_requested','需人工办理':'human_required'}
+HANDOFF_PATTERN = re.compile(r'\[转人工(?:\s*[:：]\s*([^\]]*))?\s*\]')
+
+
+@dataclass
+class AIAnswer:
+    answer: str
+    handoff: bool
+    reason_code: str
+    evidence: dict = field(default_factory=dict)
+
+    def __iter__(self):
+        # Preserve the existing (answer, handoff) caller contract.
+        return iter((self.answer, self.handoff))
+
+
+def parse_answer(text: str, evidence: dict) -> AIAnswer:
+    matches = list(HANDOFF_PATTERN.finditer(text))
+    code = HANDOFF_CODES.get((matches[0].group(1) or '').strip(), 'model_handoff') if matches else 'answered'
+    answer = HANDOFF_PATTERN.sub('', text)
+    if '[转人工' in answer:  # A provider may stop in the middle of its marker.
+        code = 'model_handoff' if code == 'answered' else code
+        answer = answer.split('[转人工',1)[0]
+    answer = answer.strip()[:5000]
+    if code == 'answered' and not answer:
+        code = 'empty_answer'
+    return AIAnswer(answer, code != 'answered', code, evidence)
 
 
 def _completion(base_url: str, api_key: str, model: str, messages: list[dict], timeout: int = 40) -> str:
@@ -146,9 +198,10 @@ def build_messages(site: dict, history: list[dict], context: str, extra: str) ->
         f"你是「{site['name']}」网站的在线客服助手，正在网页上回答访客的问题。\n"
         "规则：\n"
         "1. 只根据下面【资料】中的内容回答，不要编造资料里没有的价格、政策、时间、联系方式等信息。\n"
-        f"2. 资料里找不到答案，或者访客要求人工、投诉、退款、下单付款等需要人工处理的情况，只回复：{HANDOFF}\n"
+        "2. 资料里找不到答案时只回复：[转人工:资料不足]；访客要求人工时只回复：[转人工:访客要求]；"
+        "投诉、退款、下单付款等需要人工处理时只回复：[转人工:需人工办理]。不要编造转人工理由或解释思考过程。\n"
         "3. 访客只是打招呼或道谢时，可以简短礼貌地回应。\n"
-        "4. 用中文回答，简洁友好，不超过 200 字，不要使用 Markdown 格式。\n"
+        "4. 用中文回答，简洁友好，不超过 200 字，不要使用 Markdown 格式，不要在回答中输出资料编号。\n"
         + (f"5. {extra.strip()}\n" if extra.strip() else "")
         + f"\n【资料】\n{context or '（无）'}"
     )
@@ -165,14 +218,70 @@ def build_messages(site: dict, history: list[dict], context: str, extra: str) ->
     return msgs
 
 
-async def ai_answer(site: dict, conv_id: int, question: str) -> tuple[str, bool]:
-    """返回 (回答, 是否转人工)。出错抛 AIError。"""
-    s = ai_settings()
-    context = retrieve(site["id"], question)
-    msgs = build_messages(site, chat.history(conv_id, 12), context, s["prompt"])
-    text = await asyncio.to_thread(_completion, s["base_url"], s["api_key"], s["model"], msgs)
-    handoff = HANDOFF in text
-    return text.replace(HANDOFF, "").strip(), handoff
+async def evaluate(site: dict, history: list[dict], question: str, settings: dict | None = None) -> AIAnswer:
+    s = settings or ai_settings()
+    context, sources = retrieve_sources(site['id'], question)
+    evidence = {'context':context,'sources':sources,'model':s['model'][:200]}
+    msgs = build_messages(site, history, context, s['prompt'])
+    try:
+        text = await asyncio.to_thread(_completion, s['base_url'], s['api_key'], s['model'], msgs)
+    except AIError as exc:
+        exc.evidence = evidence
+        raise
+    return parse_answer(text, evidence)
+
+
+async def ai_answer(site: dict, conv_id: int, question: str) -> AIAnswer:
+    return await evaluate(site, chat.history(conv_id, 12), question)
+
+
+def save_decision(db, conv_id, upto, trigger, question, answer, reason_code, evidence,
+                  *, message_id=None, inbox_id=None, delivery_id=None):
+    """Persist only bounded evidence and explicit outcomes, never provider errors/secrets/prompts."""
+    outcome = 'answered' if reason_code == 'answered' else 'error' if reason_code in ('api_error','empty_answer') else 'disabled' if reason_code in ('disabled','unconfigured') else 'handoff'
+    origin = '模型回答' if reason_code == 'answered' else '模型分类' if reason_code in ('insufficient_sources','visitor_requested','human_required','model_handoff') else '系统状态'
+    sources = evidence.get('sources', [])
+    return db.execute(
+        'INSERT INTO ai_decisions (conversation_id,source_upto,message_id,inbox_message_id,qq_delivery_id,outcome,trigger,reason_code,reason,reason_origin,model,question,question_truncated,answer,context,sources,source_count) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        (conv_id,upto,message_id,inbox_id,delivery_id,outcome,trigger,reason_code,REASONS[reason_code],origin,
+         evidence.get('model','')[:200],question[:6000],int(len(question)>6000),answer[:5000],evidence.get('context',''),json.dumps(sources,ensure_ascii=False),len(sources))).lastrowid
+
+
+def _decision_conv(db, conv_id):
+    if not db.execute('SELECT 1 FROM conversations WHERE id=?',(conv_id,)).fetchone():
+        raise HTTPException(404,'会话不存在')
+
+
+@router.get('/api/admin/conversations/{conv_id}/ai-decisions', tags=['AI'], dependencies=[admin])
+def list_decisions(conv_id: int, page: int = Query(default=1,ge=1,le=1000000), size: int = Query(default=20,ge=1,le=100),
+                   message_id: int | None = Query(default=None,gt=0), delivery_id: int | None = Query(default=None,gt=0)):
+    with get_db() as db:
+        _decision_conv(db,conv_id)
+        where,args = 'conversation_id=?',[conv_id]
+        if message_id:
+            if not db.execute("SELECT 1 FROM chat_messages WHERE id=? AND conversation_id=? AND sender='ai'",(message_id,conv_id)).fetchone():
+                raise HTTPException(404,'AI 消息不存在或不属于此会话')
+            where += ' AND message_id=?'; args.append(message_id)
+        if delivery_id:
+            if not db.execute('SELECT 1 FROM qq_deliveries WHERE id=? AND conversation_id=?',(delivery_id,conv_id)).fetchone():
+                raise HTTPException(404,'投递记录不存在或不属于此会话')
+            where += ' AND qq_delivery_id=?'; args.append(delivery_id)
+        total = db.execute('SELECT COUNT(*) FROM ai_decisions WHERE '+where,args).fetchone()[0]
+        items = rows(db.execute('SELECT id,conversation_id,message_id,qq_delivery_id,inbox_message_id,outcome,trigger,reason_code,reason,reason_origin,model,source_count,created_at '
+                                'FROM ai_decisions WHERE '+where+' ORDER BY id DESC LIMIT ? OFFSET ?',(*args,size,(page-1)*size)))
+    return {'items':items,'total':total,'page':page,'size':size}
+
+
+@router.get('/api/admin/conversations/{conv_id}/ai-decisions/{decision_id}', tags=['AI'], dependencies=[admin])
+def decision_detail(conv_id: int, decision_id: int):
+    with get_db() as db:
+        row = db.execute('SELECT * FROM ai_decisions WHERE id=? AND conversation_id=?',(decision_id,conv_id)).fetchone()
+    if not row:
+        raise HTTPException(404,'AI 处理记录不存在')
+    result = dict(row)
+    result['sources'] = json.loads(result['sources'])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -200,23 +309,22 @@ def _unhandled(conv_id: int) -> list[dict]:
             "ORDER BY m.id", (conv_id, conv_id)))
 
 
-def archive(conv: dict, msgs: list[dict], note: str):
+def archive(db, conv: dict, msgs: list[dict], note: str):
     """记为留言（同一会话 24 小时内未处理的留言直接追加，避免刷屏）。"""
     lines = [f"[图片] {m['content']}" if m["msg_type"] == "image" else m["content"] for m in msgs]
     text = "\n".join(lines) + f"\n（{note}，来自对话 #{conv['id']}）"
-    with get_db() as db:
-        v = db.execute("SELECT * FROM visitors WHERE id = ?", (conv["visitor_id"],)).fetchone()
-        existing = db.execute(
-            "SELECT id, content FROM messages WHERE conversation_id = ? AND status = 'new' "
-            "AND created_at >= datetime('now','localtime','-1 day') ORDER BY id DESC LIMIT 1", (conv["id"],)).fetchone()
-        if existing:
-            db.execute("UPDATE messages SET content = ?, updated_at = datetime('now','localtime') WHERE id = ?",
-                       ((existing["content"] + "\n\n" + text)[-5000:], existing["id"]))
-        else:
-            db.execute(
-                "INSERT INTO messages (site_id, name, contact, content, page_url, ip, user_agent, conversation_id) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (conv["site_id"], v["name"], v["contact"], text[-5000:], conv["page_url"], v["ip"], v["user_agent"], conv["id"]))
+    v = db.execute("SELECT * FROM visitors WHERE id = ?", (conv["visitor_id"],)).fetchone()
+    existing = db.execute(
+        "SELECT id, content FROM messages WHERE conversation_id = ? AND status = 'new' "
+        "AND created_at >= datetime('now','localtime','-1 day') ORDER BY id DESC LIMIT 1", (conv["id"],)).fetchone()
+    if existing:
+        db.execute("UPDATE messages SET content = ?, updated_at = datetime('now','localtime') WHERE id = ?",
+                   ((existing["content"] + "\n\n" + text)[-5000:], existing["id"]))
+        return existing['id']
+    return db.execute(
+        "INSERT INTO messages (site_id, name, contact, content, page_url, ip, user_agent, conversation_id) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (conv["site_id"], v["name"], v["contact"], text[-5000:], conv["page_url"], v["ip"], v["user_agent"], conv["id"])).lastrowid
 
 
 def _recent_notice(conv_id: int) -> bool:
@@ -238,34 +346,79 @@ async def handle_unattended(conv_id: int, reason: str):
         msgs = _unhandled(conv_id)
         if not msgs:
             return
-        with get_db() as db:   # 先标记，防止重复处理
-            db.execute("UPDATE conversations SET auto_handled_upto = ? WHERE id = ?", (msgs[-1]["id"], conv_id))
         site = chat.get_site(conv["site_id"]) or {}
-        note = "非工作时间" if reason == "offline" else "客服未及时回复"
-
-        if ai_ready(site):
-            question = "\n".join("[图片]" if m["msg_type"] == "image" else m["content"] for m in msgs)
+        if reason == 'offline':
+            if chat.site_online(site):
+                return  # Availability changed during the merge delay; use the timeout flow.
+            note = '非工作时间' if not in_work_hours(site.get('work_hours', '')) else '客服忙碌'
+        else:
+            note = '客服未及时回复'
+        enabled = ai_ready(site)
+        answer, handoff = '', True
+        reason_code, evidence = 'disabled', {}
+        question = "\n".join("[图片]" if m["msg_type"] == "image" else m["content"] for m in msgs)
+        if not enabled and ai_settings()['enabled'] and site.get('ai_enabled', 1):
+            reason_code = 'unconfigured'
+        if enabled:
             try:
-                answer, handoff = await ai_answer(site, conv_id, question)
-            except AIError as e:
-                log(f"#{conv_id} AI 调用失败，改为转留言：{e}")
+                result = await ai_answer(site, conv_id, question)
+                answer, handoff = result
+                evidence = getattr(result,'evidence',{})
+                reason_code = getattr(result,'reason_code','model_handoff' if handoff else 'answered')
+                if not answer and not handoff:
+                    handoff, reason_code = True, 'empty_answer'
+            except AIError as exc:
+                log(f"#{conv_id} AI 调用失败，改为转留言")
                 answer, handoff = "", True
-            if answer:
-                await chat.post_message(conv_id, "ai", answer)
-                await notify_agent(f"🤖 AI 已回复 #{conv_id}：{answer}", conv_id)
-            if handoff:
-                archive(conv, msgs, f"{note}，AI 转人工")
-                if not answer:
-                    await chat.post_message(conv_id, "system", HANDOFF_TEXT)
-                await notify_agent(f"⚠ #{conv_id} 需要人工处理，已记为留言", conv_id)
-            log(f"#{conv_id} {note}：AI {'转人工' if handoff else '已回答'}")
+                reason_code, evidence = 'api_error', exc.evidence or {}
+        from . import summaries
+        try:
+            summary = await summaries.prepare(conv_id, msgs[-1]['id']) if handoff and enabled and reason_code != 'api_error' else None
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return
+            raise
+        cause = REASONS[reason_code]
+        # AI may take seconds; never create a stale handoff after the agent has replied/closed.
+        conv = chat.conv_summary(conv_id)
+        if not conv:
             return
-
-        archive(conv, msgs, note)
-        if not _recent_notice(conv_id):
-            text = (site.get("offline_text") or DEFAULT_OFFLINE) if reason == "offline" else TIMEOUT_TEXT
-            await chat.post_message(conv_id, "system", text)
-        log(f"#{conv_id} {note}：已记为留言")
+        from . import qq_delivery
+        delivery_id, inbox_id, ai_message = None, None, None
+        with get_db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            state = db.execute('SELECT status,auto_handled_upto FROM conversations WHERE id=?', (conv_id,)).fetchone()
+            last_agent = db.execute("SELECT MAX(id) FROM chat_messages WHERE conversation_id=? AND sender='agent'", (conv_id,)).fetchone()[0] or 0
+            upto = msgs[-1]['id']
+            if not state or state['status'] == 'closed' or state['auto_handled_upto'] >= upto or last_agent >= upto:
+                return
+            if handoff:
+                summary = summaries.save(db, summary)
+                detail = note + '；' + cause
+                inbox_id = archive(db, conv, msgs, detail)
+                delivery_id = qq_delivery.enqueue_handoff(db, conv, msgs, detail, inbox_id, answer, summary=summary)
+            if answer:
+                ai_message = chat.add_message(conv_id,'ai',answer,db=db)
+            decision_id = save_decision(db,conv_id,upto,note,question,answer,reason_code,evidence,
+                                        message_id=ai_message['id'] if ai_message else None,inbox_id=inbox_id,delivery_id=delivery_id)
+            # Archive, notification snapshot and progress commit together, before network I/O.
+            db.execute('UPDATE conversations SET auto_handled_upto=? WHERE id=?', (upto, conv_id))
+        if ai_message:
+            await chat.broadcast_message(conv_id,ai_message)
+        await chat.hub.to_admins({'type':'ai_decision_changed','conversation_id':conv_id,'decision_id':decision_id})
+        if handoff:
+            if summary:
+                await chat.hub.to_admins({'type':'conversation_summary_changed','conversation_id':conv_id})
+            await chat.hub.to_admins({'type': 'inbox_changed', 'conversation_ids': [conv_id]})
+            if not answer and not _recent_notice(conv_id):
+                text = HANDOFF_TEXT if enabled else ((site.get('offline_text') or DEFAULT_OFFLINE) if reason == 'offline' else TIMEOUT_TEXT)
+                await chat.post_message(conv_id, 'system', text)
+            if delivery_id:
+                await qq_delivery._changed(delivery_id, conv_id)
+                await qq_delivery.flush_conversation(conv_id)
+        elif answer:
+            await notify_agent(f'🤖 AI 已回复 #{conv_id}：{answer}', conv_id)
+        log(f"#{conv_id} {note}：{'已记为留言' if handoff else 'AI 已回答'}")
 
 
 async def on_visitor_message(conv: dict, msg: dict):
@@ -464,6 +617,8 @@ async def _crawl_loop():
 
 class AISettingsIn(BaseModel):
     enabled: bool
+    triage_enabled: bool | None = None
+    auto_tags: bool | None = None
     base_url: str = ""
     model: str = ""
     prompt: str = ""
@@ -489,6 +644,10 @@ def put_ai_settings(body: AISettingsIn):
         "ai_prompt": body.prompt.strip()[:2000],
         "no_reply_minutes": str(max(1, min(body.no_reply_minutes, 120))),
     }
+    if body.triage_enabled is not None:
+        values["ai_triage_enabled"] = "1" if body.triage_enabled else "0"
+    if body.auto_tags is not None:
+        values["ai_auto_tags"] = "1" if body.auto_tags else "0"
     if body.api_key is not None:
         values["ai_api_key"] = body.api_key.strip()
     set_settings(values)
@@ -496,8 +655,8 @@ def put_ai_settings(body: AISettingsIn):
 
 
 class AITestIn(BaseModel):
-    question: str
-    site_id: int | None = None
+    question: str = Field(min_length=1,max_length=5000)
+    site_id: int | None = Field(default=None,gt=0)
 
 
 @router.post("/api/admin/ai/test", tags=["AI"], dependencies=[admin])
@@ -506,14 +665,15 @@ async def test_ai(body: AITestIn):
     if not (s["base_url"] and s["api_key"] and s["model"]):
         raise HTTPException(400, "请先填写接口地址、API Key 和模型名称")
     site = chat.get_site(body.site_id) if body.site_id else None
+    if body.site_id and not site:
+        raise HTTPException(404,'站点不存在')
     site = site or {"id": 0, "name": "测试站点"}
-    context = retrieve(site["id"], body.question)
-    msgs = build_messages(site, [{"sender": "visitor", "msg_type": "text", "content": body.question}], context, s["prompt"])
     try:
-        text = await asyncio.to_thread(_completion, s["base_url"], s["api_key"], s["model"], msgs)
-    except AIError as e:
-        raise HTTPException(502, str(e))
-    return {"answer": text.replace(HANDOFF, "").strip(), "handoff": HANDOFF in text, "context": context}
+        result = await evaluate(site,[{'sender':'visitor','msg_type':'text','content':body.question}],body.question,s)
+    except AIError:
+        raise HTTPException(502,'AI 服务暂不可用，请检查接口配置和服务状态')
+    return {'answer':result.answer,'handoff':result.handoff,'reason_code':result.reason_code,
+            'reason':REASONS[result.reason_code],**result.evidence}
 
 
 class QAIn(BaseModel):
