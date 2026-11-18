@@ -16,6 +16,7 @@ import json
 import re
 import secrets
 import time
+from contextlib import nullcontext
 import urllib.error
 import urllib.request
 
@@ -24,7 +25,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import auth, auto, chat, media
+from . import auth, auto, chat, media, qq_inbound
 from .config import (QQ_API_BASE, QQ_APP_ID, QQ_APP_SECRET, QQ_MERGE_DELAY, QQ_PASSIVE_MAX, QQ_PASSIVE_WINDOW,
                      QQ_TOKEN_URL)
 from .db import get_db, rows
@@ -200,11 +201,11 @@ def agent() -> dict:
         return dict(db.execute("SELECT * FROM qq_agent WHERE id = 1").fetchone())
 
 
-def update_agent(**fields):
+def update_agent(*, db=None, **fields):
     if not fields:
         return
     cols = ", ".join(f"{k} = ?" for k in fields)
-    with get_db() as db:
+    with (get_db() if db is None else nullcontext(db)) as db:
         db.execute(f"UPDATE qq_agent SET {cols} WHERE id = 1", list(fields.values()))
 
 
@@ -256,10 +257,13 @@ async def _send_one(openid: str, body: dict, conv_id: int | None) -> str:
     return str(next(ref for ref in refs if ref))
 
 
-async def deliver(text: str, conv_id: int | None = None, openid: str = "") -> tuple[list[str], str]:
+async def deliver(text: str, conv_id: int | None = None, openid: str = "", *, binding_version: int | None = None) -> tuple[list[str], str]:
     """发文字给客服。返回 (成功发出的 QQ 消息 ID 列表, 失败原因)。发出的消息记入 qq_forwards 供引用回复定位。"""
     async with _send_lock:
-        openid = openid or agent()["openid"]
+        owner = agent()
+        if binding_version is not None and (owner["openid"] != openid or owner["binding_version"] != binding_version):
+            return [], "客服绑定已变更"
+        openid = openid or owner["openid"]
         if not openid:
             return [], "尚未绑定客服"
         ids: list[str] = []
@@ -324,11 +328,9 @@ def _spawn(coro):
 
 
 async def on_visitor_message(conv: dict, msg: dict):
-    """chat 模块的访客消息 hook。"""
+    """Schedule forwarding for a visitor message already stored with its queue state."""
     if not agent()["openid"]:
         return
-    with get_db() as db:
-        db.execute("UPDATE chat_messages SET qq_state = 'pending' WHERE id = ?", (msg["id"],))
     conv_id = conv["id"]
     if conv_id not in _flush_timers:
         loop = asyncio.get_running_loop()
@@ -357,14 +359,33 @@ async def flush_backlog():
     await flush()
 
 
+_backlog_wake: asyncio.Event | None = None
+
+
+def wake_backlog():
+    if _backlog_wake is not None:
+        _backlog_wake.set()
+
+
 async def _backlog_loop():
-    while True:
-        await asyncio.sleep(30)
-        try:
-            if agent()["openid"]:
-                await flush_backlog()
-        except Exception as e:  # noqa: BLE001
-            log(f"积压重试异常：{e}")
+    global _backlog_wake
+
+    _backlog_wake = asyncio.Event()
+    try:
+        while True:
+            _backlog_wake.clear()
+            try:
+                if agent()["openid"]:
+                    await flush_backlog()
+            except Exception as exc:
+                log(f"积压重试异常：{type(exc).__name__}")
+            try:
+                async with asyncio.timeout(30):
+                    await _backlog_wake.wait()
+            except TimeoutError:
+                pass
+    finally:
+        _backlog_wake = None
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +401,8 @@ def _conv_line(c: dict, current: int | None) -> str:
 async def handle_command(content: str, a: dict):
     m = re.match(r"^/(\S+?)\s*(?:#?(\d+))?\s*$", content)
     cmd, arg = (m.group(1), int(m.group(2)) if m.group(2) else None) if m else ("", None)
-    say = lambda text: deliver(text)  # noqa: E731
+    async def say(text):
+        await deliver(text, openid=a["openid"], binding_version=a["binding_version"])
 
     if cmd in ("帮助", "help", "h", "?"):
         return await say(HELP)
@@ -486,137 +508,169 @@ def quoted_refs(d: dict) -> list[str]:
     return [r for i, r in enumerate(refs) if r and r not in refs[:i]]
 
 
-def _debug_shape(d: dict) -> str:
-    """记录引用相关字段的结构（不含文字内容），用于核对平台格式。"""
-    scene = d.get("message_scene")
-    els = [{k: (v if k.endswith("idx") or k in ("message_type", "id") else type(v).__name__) for k, v in el.items()}
-           for el in (d.get("msg_elements") or []) if isinstance(el, dict)]
-    return json.dumps({"message_type": d.get("message_type"), "message_scene": scene, "msg_elements": els},
-                      ensure_ascii=False)[:600]
+def _resolve_reply(d: dict, content: str, has_images: bool, inbound: dict, owner: dict):
+    """Return a conversation, text, whether the reply is implicit and any rejection message."""
+    refs = quoted_refs(d)
+    targets = set()
+    if refs:
+        with get_db() as db:
+            marks = ",".join("?" for _ in refs)
+            targets = {row[0] for row in db.execute(
+                f"SELECT DISTINCT conversation_id FROM qq_forwards WHERE qq_msg_id IN ({marks})", refs
+            )}
+    explicit = re.fullmatch(r"#(\d+)(?:\s+(.*))?", content, re.S)
+    text = (explicit.group(2) or "").strip() if explicit else content
+    if explicit and not text and not has_images:
+        return None, text, False, f"请在 #{explicit.group(1)} 后面写上要回复的内容"
+    if explicit and len(explicit.group(1)) > 19:
+        return None, text, False, "会话编号无效"
+    target = int(explicit.group(1)) if explicit else None
+    if target is not None and not 0 < target <= (1 << 63) - 1:
+        return None, text, False, "会话编号无效"
+    if len(targets) > 1 or (targets and target is not None and target not in targets):
+        return None, text, False, "引用消息与回复目标不一致，未发送。请单独用「#编号 内容」回复。"
+    if target is not None or targets:
+        return target if target is not None else targets.pop(), text, False, ""
+    if refs or d.get("message_reference"):
+        return None, text, False, "找不到引用消息对应的会话，未发送。请用「#编号 内容」明确指定。"
+    target = inbound["default_conv_id"]
+    if not target or not owner["current_conv_id"]:
+        return None, text, True, "当前没有可回复的会话。发 /列表 查看，或用「#编号 内容」指定。"
+    set_at = inbound["default_set_at"]
+    if (owner["current_conv_id"] != target or owner["current_set_at"] != set_at
+            or (set_at and inbound["received_at"] - set_at < SWITCH_GUARD_SECONDS)):
+        return None, text, True, "当前会话刚切换，未发送。请引用原消息，或用「#编号 内容」回复。"
+    return target, text, True, ""
 
 
-async def handle_c2c(d: dict):
-    openid = str((d.get("author") or {}).get("user_openid") or "")
+async def _bind_from_inbound(openid: str, msg_id: str, code: str, inbound: dict):
+    from .qq_delivery import queue_lock, cancel_for_binding_change
+
+    version = None
+    async with queue_lock, _send_lock:
+        with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            owner = db.execute("SELECT * FROM qq_agent WHERE id=1").fetchone()
+            valid = (owner["binding_version"] == inbound["binding_version"] and owner["bind_code"]
+                     and secrets.compare_digest(owner["bind_code"], code) and time.time() < owner["bind_expires"])
+            qq_inbound.finish(db, inbound["id"])
+            if valid:
+                version = owner["binding_version"]
+                if owner["openid"] != openid:
+                    version += 1
+                    cancel_for_binding_change(db=db)
+                    update_agent(db=db, current_conv_id=None, current_set_at=0, binding_version=version)
+                update_agent(db=db, openid=openid, bound_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                             bind_code="", bind_expires=0, last_msg_id=msg_id,
+                             last_msg_at=inbound["received_at"], passive_used=0)
+    if version is None:
+        await reply_to(openid, msg_id, "绑定码无效或已过期，请在 MsgHub 后台重新生成。")
+    else:
+        log("客服绑定成功")
+        await deliver("绑定成功！网站访客的消息之后会转发到这里。\n\n" + HELP,
+                      openid=openid, binding_version=version)
+        wake_backlog()
+
+
+async def handle_c2c(d: dict, *, inbound: dict):
+    author = d.get("author")
+    openid = str(author.get("user_openid") or "") if isinstance(author, dict) else ""
     content = str(d.get("content") or "").strip()
     msg_id = str(d.get("id") or "")
     if not openid:
         return
-    a = agent()
-
-    # 绑定：/绑定 123456
-    m = re.match(r"^/?绑定\s*(\d{6})$", content)
-    if m:
-        from .qq_delivery import queue_lock, cancel_for_binding_change
-        bound = False
-        async with queue_lock, _send_lock:
-            a = agent()  # The code may have been consumed while this callback waited.
-            if a["bind_code"] and secrets.compare_digest(a["bind_code"], m.group(1)) and time.time() < a["bind_expires"]:
-                if a['openid'] != openid:
-                    cancel_for_binding_change()
-                    update_agent(current_conv_id=None, current_set_at=0)
-                update_agent(openid=openid, bound_at=time.strftime("%Y-%m-%d %H:%M:%S"), bind_code="", bind_expires=0,
-                             last_msg_id=msg_id, last_msg_at=time.time(), passive_used=0)
-                bound = True
-        if bound:
-            log("客服绑定成功")
-            await deliver("绑定成功！网站访客的消息之后会转发到这里。\n\n" + HELP, openid=openid)
-            await flush_backlog()
-        else:
-            await reply_to(openid, msg_id, "绑定码无效或已过期，请在 MsgHub 后台重新生成。")
+    owner = agent()
+    version = inbound["binding_version"]
+    if owner["binding_version"] != version:
         return
-    if openid != a["openid"]:
+    bind = re.fullmatch(r"/?绑定\s*([0-9]{6})", content)
+    if bind:
+        await _bind_from_inbound(openid, msg_id, bind.group(1), inbound)
+        return
+    if openid != owner["openid"]:
         await reply_to(openid, msg_id, "这是网站客服机器人，仅供已绑定的客服使用。")
         return
 
-    update_agent(last_msg_id=msg_id, last_msg_at=time.time(), passive_used=0)
-    a = agent()
-    await flush_backlog()  # 客服刚发过消息，被动窗口打开，先补发积压
-    a = agent()  # Backlog delivery may have changed or cleared the guarded reply target.
-    if openid != a['openid']:
-        return
+    received_at = inbound["received_at"]
+    if msg_id and received_at > owner["last_msg_at"] and time.time() - received_at < QQ_PASSIVE_WINDOW:
+        update_agent(last_msg_id=msg_id, last_msg_at=received_at, passive_used=0)
+        wake_backlog()
+
+    async def tell(text):
+        await deliver(text, openid=openid, binding_version=version)
 
     attachments = [x for x in (d.get("attachments") or []) if isinstance(x, dict)]
     images = [x for x in attachments if str(x.get("content_type", "")).startswith("image")]
+    warnings = []
     if len(images) < len(attachments):
-        await deliver("暂不支持把文件 / 语音 / 视频转给访客，请发送文字或图片。")
+        warnings.append("暂不支持把文件 / 语音 / 视频转给访客，请发送文字或图片。")
     if not content and not images:
+        if warnings:
+            await tell(warnings[0])
         return
     if content.startswith("/") and not images:
-        await handle_command(content, a)
+        # Commands with an omitted conversation number keep the target at acceptance time.
+        await handle_command(content, {**owner, "current_conv_id": inbound["default_conv_id"]})
         return
 
-    # 定位目标会话：引用 → #编号 → 当前会话
-    target, text, implicit = None, content, False
-    refs = quoted_refs(d)
-    if refs:
-        with get_db() as db:
-            marks = ",".join("?" * len(refs))
-            r = db.execute(f"SELECT conversation_id FROM qq_forwards WHERE qq_msg_id IN ({marks}) LIMIT 1",
-                           refs).fetchone()
-        target = r[0] if r else None
-        log(f"引用回复 → {'#' + str(target) if target else '未找到对应会话'}（候选 {[x[:24] for x in refs]}）")
-    m = re.match(r"^#(\d+)(?:\s+(.*))?$", content, re.S)
-    if m and not (m.group(2) or "").strip() and not images:
-        if len(images) == len(attachments):   # 没有附件（有不支持的附件时上面已提示过）
-            await deliver(f"请在 #{m.group(1)} 后面写上要回复的内容")
+    target, text, implicit, error = _resolve_reply(d, content, bool(images), inbound, owner)
+    if inbound["target_conv_id"] is not None:
+        target, implicit, error = inbound["target_conv_id"], bool(inbound["implicit"]), ""
+    if error:
+        await tell(error)
         return
-    if m:
-        target, text = int(m.group(1)), (m.group(2) or "").strip()
-    if not target:
-        implicit = True
-        target = a["current_conv_id"]
-        if not target:
-            await deliver("当前没有可回复的会话。发 /列表 查看，或用「#编号 内容」指定。")
-            return
-        if a["current_set_at"] and time.time() - a["current_set_at"] < SWITCH_GUARD_SECONDS:
-            await deliver(f"刚有新会话 #{target} 的消息进来，为避免回错人，这条没有发出。\n"
-                          "请引用要回复的消息，或发「#编号 内容」。")
-            return
     if not chat.conv_summary(target):
-        await deliver(f"会话 #{target} 不存在")
+        await tell(f"会话 #{target} 不存在")
         return
+    qq_inbound.pin_reply(inbound, target, implicit)
 
-    for img in images:
-        try:
-            data = await asyncio.to_thread(_download, str(img.get("url") or ""))
-            path = media.save_image(data)
-        except Exception as e:  # noqa: BLE001
-            log(f"下载客服图片失败：{e!r}")
-            await deliver(f"图片没能发给 #{target}：{e}")
-            continue
-        await chat.agent_reply(target, path, "image")
-    if text:
-        await chat.agent_reply(target, text)
-    if implicit:
-        await deliver(f"✓ 已发给 #{target}")
-    elif target != a["current_conv_id"]:
-        update_agent(current_conv_id=target, current_set_at=0)
+    contents = []
+    messages = []
+    try:
+        for img in images:
+            try:
+                data = await asyncio.to_thread(_download, str(img.get("url") or ""))
+                path = media.save_image(data)
+            except (urllib.error.URLError, TimeoutError) as exc:
+                retryable = not isinstance(exc, urllib.error.HTTPError) or exc.code in (408, 429) or exc.code >= 500
+                if retryable and inbound["attempts"] + 1 < qq_inbound.MAX_ATTEMPTS:
+                    raise
+                warnings.append(f"图片没能发给 #{target}，请重新发送。")
+            except ValueError:
+                warnings.append(f"图片没能发给 #{target}，请重新发送。")
+            else:
+                contents.append(("image", path))
+        if text:
+            contents.append(("text", text))
+        messages, error = qq_inbound.commit_reply(inbound, openid, target, implicit, contents)
+    finally:
+        if not messages:
+            # A cancelled or rolled-back reply has no message referencing these new files.
+            for kind, content in contents:
+                if kind == "image":
+                    path = media.local_path(content)
+                    if path:
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            log("未使用的 QQ 图片清理失败")
+    for message in messages:
+        if not chat.conv_summary(target):
+            break
+        await chat.broadcast_message(target, message)
+    if messages and chat.conv_summary(target):
+        await chat.hub.to_visitor(target, {"type": "status", "status": "active"})
+    if error:
+        warnings.append(error)
+    if implicit and messages:
+        warnings.append(f"✓ 已发给 #{target}")
+    if warnings:
+        await tell("\n".join(warnings))
 
 
 # ---------------------------------------------------------------------------
 # 平台回调
 # ---------------------------------------------------------------------------
-
-_seen_events: dict[str, float] = {}
-
-
-def _duplicate(event_id: str) -> bool:
-    now = time.time()
-    if len(_seen_events) > 2000:
-        for k in [k for k, t in _seen_events.items() if now - t > 600]:
-            del _seen_events[k]
-    if event_id in _seen_events:
-        return True
-    _seen_events[event_id] = now
-    return False
-
-
-async def _run(coro, label: str):
-    try:
-        await coro
-    except Exception as e:  # noqa: BLE001
-        log(f"处理 {label} 出错：{e!r}")
-
 
 @router.post("/api/qq/callback", include_in_schema=False)
 async def callback(request: Request):
@@ -627,6 +681,8 @@ async def callback(request: Request):
         payload = json.loads(body)
     except ValueError:
         return JSONResponse({"error": "invalid json"}, 400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "invalid event"}, 400)
     appid = request.headers.get("x-bot-appid")
     if appid and appid != QQ_APP_ID:
         return JSONResponse({"error": "appid mismatch"}, 403)
@@ -643,18 +699,13 @@ async def callback(request: Request):
         log("签名校验失败，已拒绝")
         return JSONResponse({"error": "invalid signature"}, 401)
 
-    update_agent(last_event_at=time.strftime("%Y-%m-%d %H:%M:%S"))
-    if op == 0:
-        t, d = payload.get("t"), payload.get("d") or {}
-        event_id = str(payload.get("id") or d.get("id") or "")
-        if event_id and _duplicate(event_id):
-            return {"op": 12}
-        ref = d.get("message_reference")
-        log(f"事件 {t}，字段 {sorted(d.keys())}" + (f"，引用 {json.dumps(ref, ensure_ascii=False)[:120]}" if ref else ""))
-        if t == "C2C_MESSAGE_CREATE":
-            if d.get("msg_elements") or d.get("message_reference"):
-                log(f"引用相关字段：{_debug_shape(d)}")
-            _spawn(_run(handle_c2c(d), t))
+    if op == 0 and payload.get("t") == "C2C_MESSAGE_CREATE":
+        data = payload.get("d")
+        if not isinstance(data, dict):
+            return JSONResponse({"error": "invalid event"}, 400)
+        qq_inbound.accept(QQ_APP_ID, str(payload.get("id") or ""), data)
+    else:
+        update_agent(last_event_at=time.strftime("%Y-%m-%d %H:%M:%S"))
     return {"op": 12}
 
 
@@ -678,6 +729,10 @@ async def status():
         token_ok, token_error = False, safe_error(e)
     with get_db() as db:
         pending = db.execute("SELECT COUNT(*) FROM chat_messages WHERE qq_state = 'pending'").fetchone()[0]
+        inbound_pending, inbound_failed = db.execute(
+            "SELECT COUNT(CASE WHEN status='pending' THEN 1 END),COUNT(CASE WHEN status='failed' THEN 1 END) "
+            "FROM qq_inbound WHERE status IN ('pending','failed') AND app_id=?", (QQ_APP_ID,)
+        ).fetchone()
         priority_pending = db.execute("SELECT COUNT(*) FROM qq_deliveries WHERE kind='priority' AND status NOT IN ('sent','cancelled')").fetchone()[0]
         handoffs_pending = db.execute("SELECT COUNT(*) FROM qq_deliveries WHERE kind='handoff' AND status NOT IN ('sent','cancelled')").fetchone()[0]
     window = max(0, int(QQ_PASSIVE_WINDOW - (time.time() - a["last_msg_at"]))) if passive_available(a) else 0
@@ -697,6 +752,8 @@ async def status():
         "pending": pending,
         "handoffs_pending": handoffs_pending,
         "priority_pending": priority_pending,
+        "inbound_pending": inbound_pending,
+        "inbound_failed": inbound_failed,
         "bind_code": a["bind_code"] if a["bind_code"] and time.time() < a["bind_expires"] else "",
         "bind_expires_in": max(0, int(a["bind_expires"] - time.time())),
     }
@@ -715,9 +772,12 @@ def bind_code():
 async def unbind():
     from .qq_delivery import queue_lock, cancel_for_binding_change
     async with queue_lock, _send_lock:
-        update_agent(openid="", bound_at=None, last_msg_id="", last_msg_at=0, passive_used=0,
-                     current_conv_id=None, current_set_at=0)
-        cancel_for_binding_change()
+        with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            version = db.execute("SELECT binding_version FROM qq_agent WHERE id=1").fetchone()[0]
+            update_agent(db=db, openid="", bound_at=None, last_msg_id="", last_msg_at=0, passive_used=0,
+                         current_conv_id=None, current_set_at=0, binding_version=version + 1, bind_code="", bind_expires=0)
+            cancel_for_binding_change(db=db)
     return {"ok": True}
 
 
@@ -745,4 +805,5 @@ def setup():
     chat.agent_available = lambda: (lambda a: not a["openid"] or bool(a["online"]))(agent())
     auto.notify_agent = notify
     _spawn(_backlog_loop())
+    _spawn(qq_inbound.run())
     log(f"已启用，AppID {QQ_APP_ID}")

@@ -2,6 +2,7 @@
 import asyncio
 import re
 import time
+from contextlib import nullcontext
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -55,12 +56,13 @@ def recover():
                 _finish(db, r[0])
 
 
-def cancel_for_binding_change():
+def cancel_for_binding_change(*, db=None):
     """Caller holds queue_lock; pending content must not move to a different QQ account."""
-    with get_db() as db:
+    with (get_db() if db is None else nullcontext(db)) as db:
         db.execute("UPDATE qq_deliveries SET status='cancelled', last_error='客服绑定已变更，停止此投递', next_attempt_at=0, updated_at=datetime('now','localtime') WHERE status NOT IN ('sent','cancelled')")
         db.execute("UPDATE chat_messages SET qq_state='' WHERE qq_state='pending'")
         db.execute("DELETE FROM conversation_triage_jobs")
+        db.execute("UPDATE qq_inbound SET status='cancelled',payload=NULL WHERE status='pending'")
 
 
 async def _changed(delivery_id, conv_id):

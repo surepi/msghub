@@ -1,12 +1,7 @@
-"""无人值守处理：AI 自动应答、转留言、网站内容抓取（二期第 ③ 阶段）。
+"""AI first response, human handoff, unattended archiving and site crawling.
 
-触发
-    · 非工作时间 / 客服设为忙碌：访客消息立即处理
-    · 工作时间内：访客消息 NO_REPLY_MINUTES 分钟内客服没回复，由后台循环处理
-处理
-    · AI 已开启（全局 + 站点）→ 根据问答库和抓取的网站内容回答；没有依据 / 访客要人工 → 转人工：记为留言
-    · 未开启 AI → 记为留言，并提示访客
-AI 回复会同步给客服 QQ；客服随时可以接管（客服回复后，AI 不再处理此前的消息）。
+Configured sites start AI after a short merge window. Human replies take over the
+conversation. Sites without AI still archive unanswered messages on the existing schedule.
 """
 import asyncio
 import json
@@ -31,8 +26,11 @@ router = APIRouter()
 admin = Depends(auth.require_admin)
 
 HANDOFF = "[转人工]"
-HANDOFF_TEXT = "这个问题需要人工客服为您处理，已为您记录，客服会尽快通过您留下的联系方式联系您。"
+HANDOFF_TEXT = "已为您转人工，客服可以在这里回复。您也可以留下联系方式，方便后续联系。"
 TIMEOUT_TEXT = "客服暂时没能及时回复，已为您记录留言，我们会尽快通过您留下的联系方式联系您。"
+MERGE_SECONDS = 2
+LIVE_REPLY_SECONDS = 12
+LIVE_SUMMARY_SECONDS = 3
 NOTICE_COOLDOWN = 30 * 60      # 同一会话的"已转留言"提示 30 分钟内只发一次
 
 CRAWL_MAX_PAGES = 50
@@ -72,9 +70,12 @@ def ai_settings() -> dict:
     }
 
 
+def ai_configured(settings: dict) -> bool:
+    return settings["enabled"] and bool(settings["base_url"] and settings["api_key"] and settings["model"])
+
+
 def ai_ready(site: dict) -> bool:
-    s = ai_settings()
-    return s["enabled"] and bool(s["base_url"] and s["api_key"] and s["model"]) and bool(site.get("ai_enabled", 1))
+    return bool(site.get("enabled", 1) and site.get("ai_enabled", 1) and ai_configured(ai_settings()))
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +141,9 @@ REASONS = {
     'answered':'AI 已回答', 'insufficient_sources':'模型判断资料不足',
     'visitor_requested':'模型判断访客要求人工', 'human_required':'模型判断需人工办理',
     'model_handoff':'AI 判断需要人工处理（未提供具体分类）',
-    'api_error':'AI 服务暂不可用', 'empty_answer':'AI 未返回有效回答',
+    'api_error':'AI 服务暂不可用', 'reply_timeout':'AI 回复超时', 'empty_answer':'AI 未返回有效回答',
+    'first_response_expired':'已超过即时接待时间，交由人工跟进',
+    'human_pending':'已转人工，等待客服接待', 'human_active':'人工客服已接管该会话',
     'disabled':'AI 自动应答未启用', 'unconfigured':'AI 自动应答配置未完成',
 }
 HANDOFF_CODES = {'资料不足':'insufficient_sources','访客要求':'visitor_requested','需人工办理':'human_required'}
@@ -218,13 +221,14 @@ def build_messages(site: dict, history: list[dict], context: str, extra: str) ->
     return msgs
 
 
-async def evaluate(site: dict, history: list[dict], question: str, settings: dict | None = None) -> AIAnswer:
+async def evaluate(site: dict, history: list[dict], question: str, settings: dict | None = None,
+                   *, timeout: int = 40) -> AIAnswer:
     s = settings or ai_settings()
     context, sources = retrieve_sources(site['id'], question)
     evidence = {'context':context,'sources':sources,'model':s['model'][:200]}
     msgs = build_messages(site, history, context, s['prompt'])
     try:
-        text = await asyncio.to_thread(_completion, s['base_url'], s['api_key'], s['model'], msgs)
+        text = await asyncio.to_thread(_completion, s['base_url'], s['api_key'], s['model'], msgs, timeout)
     except AIError as exc:
         exc.evidence = evidence
         raise
@@ -232,13 +236,13 @@ async def evaluate(site: dict, history: list[dict], question: str, settings: dic
 
 
 async def ai_answer(site: dict, conv_id: int, question: str) -> AIAnswer:
-    return await evaluate(site, chat.history(conv_id, 12), question)
+    return await evaluate(site, chat.history(conv_id, 12), question, timeout=LIVE_REPLY_SECONDS + 1)
 
 
 def save_decision(db, conv_id, upto, trigger, question, answer, reason_code, evidence,
                   *, message_id=None, inbox_id=None, delivery_id=None):
     """Persist only bounded evidence and explicit outcomes, never provider errors/secrets/prompts."""
-    outcome = 'answered' if reason_code == 'answered' else 'error' if reason_code in ('api_error','empty_answer') else 'disabled' if reason_code in ('disabled','unconfigured') else 'handoff'
+    outcome = 'answered' if reason_code == 'answered' else 'error' if reason_code in ('api_error','reply_timeout','empty_answer','first_response_expired') else 'disabled' if reason_code in ('disabled','unconfigured') else 'handoff'
     origin = '模型回答' if reason_code == 'answered' else '模型分类' if reason_code in ('insufficient_sources','visitor_requested','human_required','model_handoff') else '系统状态'
     sources = evidence.get('sources', [])
     return db.execute(
@@ -291,6 +295,8 @@ def decision_detail(conv_id: int, decision_id: int):
 _locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 _timers: dict[int, asyncio.TimerHandle] = {}
 _tasks: set[asyncio.Task] = set()
+_running: set[int] = set()
+_live_slots = asyncio.Semaphore(4)
 
 
 def _spawn(coro):
@@ -327,128 +333,252 @@ def archive(db, conv: dict, msgs: list[dict], note: str):
         (conv["site_id"], v["name"], v["contact"], text[-5000:], conv["page_url"], v["ip"], v["user_agent"], conv["id"])).lastrowid
 
 
-def _recent_notice(conv_id: int) -> bool:
-    with get_db() as db:
-        r = db.execute(
-            "SELECT 1 FROM chat_messages WHERE conversation_id = ? AND sender = 'system' "
-            "AND created_at >= datetime('now','localtime', ?) LIMIT 1",
-            (conv_id, f"-{NOTICE_COOLDOWN // 60} minutes")).fetchone()
-    return bool(r)
+def _recent_notice(db, conv_id: int) -> bool:
+    return bool(db.execute(
+        "SELECT 1 FROM chat_messages WHERE conversation_id=? AND sender='system' "
+        "AND created_at >= datetime('now','localtime', ?) "
+        "AND id > COALESCE((SELECT MAX(id) FROM chat_messages WHERE conversation_id=? "
+        "AND sender='system' AND content=?),0) LIMIT 1",
+        (conv_id, f"-{NOTICE_COOLDOWN // 60} minutes", conv_id, chat.CONVERSATION_CLOSED_TEXT)
+    ).fetchone())
+
+
+async def _live_answer(site: dict, conv_id: int, question: str, upto: int, *, show_hint: bool):
+    if show_hint:
+        await chat.hub.to_visitor(conv_id, {"type": "ai_status", "thinking": True})
+    try:
+        async with asyncio.timeout(LIVE_REPLY_SECONDS):
+            async with _live_slots:
+                # The agent may have taken over while this request waited for a model slot.
+                conv = chat.conv_summary(conv_id)
+                if (not conv or conv["status"] != "waiting" or conv["ai_waiting_for_agent"]
+                        or conv["auto_handled_upto"] >= upto):
+                    return None
+                return await ai_answer(site, conv_id, question)
+    finally:
+        if show_hint:
+            await chat.hub.to_visitor(conv_id, {"type": "ai_status", "thinking": False})
 
 
 async def handle_unattended(conv_id: int, reason: str):
-    """reason: offline（非工作时间 / 客服忙碌）或 timeout（客服超时未回复）。"""
-    _timers.pop(conv_id, None)
+    """Respond early when AI is in charge, or archive an unanswered visitor batch."""
     async with _locks[conv_id]:
         conv = chat.conv_summary(conv_id)
-        if not conv or conv["status"] == "closed":
+        if not conv or conv["status"] == "closed" or (conv["status"] == "active" and reason not in ("timeout", "timeout_archive")):
             return
         msgs = _unhandled(conv_id)
         if not msgs:
             return
-        site = chat.get_site(conv["site_id"]) or {}
-        if reason == 'offline':
+        site = chat.get_site(conv["site_id"])
+        if not site or not site["enabled"]:
+            return
+        waiting_for_agent = bool(conv["ai_waiting_for_agent"])
+        human_active = conv["status"] == "active"
+        eligible_ai = not waiting_for_agent and not human_active and ai_ready(site)
+        enabled = eligible_ai and reason != "timeout_archive"
+        if reason == "ai_first" and not enabled and not waiting_for_agent:
             if chat.site_online(site):
-                return  # Availability changed during the merge delay; use the timeout flow.
-            note = '非工作时间' if not in_work_hours(site.get('work_hours', '')) else '客服忙碌'
+                return
+            reason = "offline"
+        if reason == "offline":
+            if enabled:
+                reason = "ai_first"
+            elif chat.site_online(site):
+                return
+        if waiting_for_agent:
+            note = "等待人工接待"
+        elif reason == "ai_first":
+            note = "AI 快速接待"
+        elif reason == "offline":
+            note = "非工作时间" if not in_work_hours(site.get("work_hours", "")) else "客服忙碌"
         else:
-            note = '客服未及时回复'
-        enabled = ai_ready(site)
+            note = "客服未及时回复"
         answer, handoff = '', True
-        reason_code, evidence = 'disabled', {}
+        reason_code, evidence = "disabled", {}
+        if waiting_for_agent:
+            reason_code = "human_pending"
+        elif human_active:
+            reason_code = "human_active"
+        elif eligible_ai and reason == "timeout_archive":
+            reason_code = "first_response_expired"
         question = "\n".join("[图片]" if m["msg_type"] == "image" else m["content"] for m in msgs)
-        if not enabled and ai_settings()['enabled'] and site.get('ai_enabled', 1):
+        if not enabled and reason_code == 'disabled' and ai_settings()['enabled'] and site.get('ai_enabled', 1):
             reason_code = 'unconfigured'
         if enabled:
             try:
-                result = await ai_answer(site, conv_id, question)
+                result = await _live_answer(site, conv_id, question, msgs[-1]["id"], show_hint=reason == "ai_first")
+                if result is None:
+                    return
                 answer, handoff = result
                 evidence = getattr(result,'evidence',{})
                 reason_code = getattr(result,'reason_code','model_handoff' if handoff else 'answered')
                 if not answer and not handoff:
                     handoff, reason_code = True, 'empty_answer'
+            except TimeoutError:
+                reason_code = "reply_timeout"
+                evidence = {"model": ai_settings()["model"][:200]}
             except AIError as exc:
                 log(f"#{conv_id} AI 调用失败，改为转留言")
                 answer, handoff = "", True
                 reason_code, evidence = 'api_error', exc.evidence or {}
+        starting_status = "active" if human_active else "waiting"
         from . import summaries
-        try:
-            summary = await summaries.prepare(conv_id, msgs[-1]['id']) if handoff and enabled and reason_code != 'api_error' else None
-        except HTTPException as exc:
-            if exc.status_code == 404:
-                return
-            raise
+        summary = None
+        if handoff and enabled and reason_code not in ("api_error", "reply_timeout"):
+            try:
+                if reason == "ai_first":
+                    async with asyncio.timeout(LIVE_SUMMARY_SECONDS):
+                        summary = await summaries.prepare(conv_id, msgs[-1]["id"])
+                else:
+                    summary = await summaries.prepare(conv_id, msgs[-1]["id"])
+            except TimeoutError:
+                pass  # The original text is sufficient to notify the agent immediately.
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    return
+                raise
         cause = REASONS[reason_code]
         # AI may take seconds; never create a stale handoff after the agent has replied/closed.
         conv = chat.conv_summary(conv_id)
         if not conv:
             return
         from . import qq_delivery
-        delivery_id, inbox_id, ai_message = None, None, None
+        delivery_id, inbox_id, ai_message, notice = None, None, None, None
         with get_db() as db:
             db.execute('BEGIN IMMEDIATE')
-            state = db.execute('SELECT status,auto_handled_upto FROM conversations WHERE id=?', (conv_id,)).fetchone()
+            state = db.execute(
+                "SELECT c.status,c.auto_handled_upto,s.enabled,s.ai_enabled FROM conversations c "
+                "JOIN sites s ON s.id=c.site_id WHERE c.id=?", (conv_id,)).fetchone()
             last_agent = db.execute("SELECT MAX(id) FROM chat_messages WHERE conversation_id=? AND sender='agent'", (conv_id,)).fetchone()[0] or 0
             upto = msgs[-1]['id']
-            if not state or state['status'] == 'closed' or state['auto_handled_upto'] >= upto or last_agent >= upto:
+            if (not state or not state["enabled"] or state["status"] != starting_status
+                    or state["status"] == "closed" or state["auto_handled_upto"] >= upto or last_agent >= upto):
+                return
+            if enabled and not ai_ready({"enabled": state["enabled"], "ai_enabled": state["ai_enabled"]}):
                 return
             if handoff:
                 summary = summaries.save(db, summary)
                 detail = note + '；' + cause
                 inbox_id = archive(db, conv, msgs, detail)
-                delivery_id = qq_delivery.enqueue_handoff(db, conv, msgs, detail, inbox_id, answer, summary=summary)
+                if not waiting_for_agent:
+                    delivery_id = qq_delivery.enqueue_handoff(db, conv, msgs, detail, inbox_id, answer, summary=summary)
+                if not waiting_for_agent and (not answer or enabled) and not _recent_notice(db, conv_id):
+                    text = HANDOFF_TEXT if enabled else ((site.get("offline_text") or DEFAULT_OFFLINE) if reason == "offline" else TIMEOUT_TEXT)
+                    notice = chat.add_message(conv_id, "system", text, db=db)
             if answer:
                 ai_message = chat.add_message(conv_id,'ai',answer,db=db)
             decision_id = save_decision(db,conv_id,upto,note,question,answer,reason_code,evidence,
                                         message_id=ai_message['id'] if ai_message else None,inbox_id=inbox_id,delivery_id=delivery_id)
             # Archive, notification snapshot and progress commit together, before network I/O.
-            db.execute('UPDATE conversations SET auto_handled_upto=? WHERE id=?', (upto, conv_id))
+            db.execute(
+                "UPDATE conversations SET auto_handled_upto=?,"
+                "ai_waiting_for_agent=CASE WHEN ? THEN 1 ELSE ai_waiting_for_agent END WHERE id=?",
+                (upto, handoff and (enabled or reason_code == "first_response_expired"), conv_id),
+            )
+        if handoff and (enabled or reason_code == "first_response_expired"):
+            await chat.hub.to_visitor(conv_id, {"type": "ai_status", "thinking": False, "handoff": True})
         if ai_message:
-            await chat.broadcast_message(conv_id,ai_message)
+            await chat.broadcast_message(conv_id, ai_message)
+        if notice:
+            await chat.broadcast_message(conv_id, notice)
         await chat.hub.to_admins({'type':'ai_decision_changed','conversation_id':conv_id,'decision_id':decision_id})
         if handoff:
             if summary:
                 await chat.hub.to_admins({'type':'conversation_summary_changed','conversation_id':conv_id})
             await chat.hub.to_admins({'type': 'inbox_changed', 'conversation_ids': [conv_id]})
-            if not answer and not _recent_notice(conv_id):
-                text = HANDOFF_TEXT if enabled else ((site.get('offline_text') or DEFAULT_OFFLINE) if reason == 'offline' else TIMEOUT_TEXT)
-                await chat.post_message(conv_id, 'system', text)
             if delivery_id:
                 await qq_delivery._changed(delivery_id, conv_id)
-                await qq_delivery.flush_conversation(conv_id)
+                if reason == "ai_first":
+                    from . import qq
+                    qq.wake_backlog()
+                else:
+                    await qq_delivery.flush_conversation(conv_id)
         elif answer:
-            await notify_agent(f'🤖 AI 已回复 #{conv_id}：{answer}', conv_id)
+            reminder = notify_agent(f"🤖 AI 已回复 #{conv_id}：{answer}", conv_id)
+            if reason == "ai_first":
+                _spawn(reminder)
+            else:
+                await reminder
         log(f"#{conv_id} {note}：{'已记为留言' if handoff else 'AI 已回答'}")
 
 
+async def _run_scheduled(cid: int, reason: str):
+    try:
+        await handle_unattended(cid, reason)
+    except Exception as exc:
+        log(f"#{cid} 自动接待异常：{type(exc).__name__}")
+    finally:
+        _running.discard(cid)
+
+
+def _schedule(cid: int, reason: str, delay: float):
+    if cid in _timers or cid in _running:
+        return
+
+    def start():
+        _timers.pop(cid, None)
+        _running.add(cid)
+        _spawn(_run_scheduled(cid, reason))
+
+    _timers[cid] = asyncio.get_running_loop().call_later(delay, start)
+
+
 async def on_visitor_message(conv: dict, msg: dict):
-    """chat 模块的访客消息 hook：非工作时间 / 客服忙碌时立即处理（稍等 2 秒合并连发的消息）。"""
-    site = chat.get_site(conv["site_id"]) or {}
-    if chat.site_online(site):
-        return  # 工作时间内交给超时检查
-    cid = conv["id"]
-    if cid not in _timers:
-        _timers[cid] = asyncio.get_running_loop().call_later(2, lambda: _spawn(handle_unattended(cid, "offline")))
+    if not conv or conv["status"] != "waiting":
+        return
+    site = chat.get_site(conv["site_id"])
+    if not site or not site["enabled"]:
+        return
+    if conv["ai_waiting_for_agent"] or ai_ready(site):
+        _schedule(conv["id"], "ai_first", MERGE_SECONDS)
+    elif not chat.site_online(site):
+        _schedule(conv["id"], "offline", MERGE_SECONDS)
+
+
+# The cursor also covers interruptions after the visitor message was committed,
+# including a process restart before the websocket hook could set its timer.
+_WAITING_MESSAGES = """
+    SELECT c.id, MAX(m.created_at) AS latest_at
+    FROM conversations c
+    JOIN sites s ON s.id=c.site_id
+    JOIN chat_messages m ON m.conversation_id=c.id AND m.sender='visitor'
+    WHERE c.status!='closed' AND s.enabled=1 AND m.id>c.auto_handled_upto
+      AND m.id>COALESCE((SELECT MAX(a.id) FROM chat_messages a
+                         WHERE a.conversation_id=c.id AND a.sender='agent'),0)
+"""
+
+
+async def _recover_ai_loop():
+    while True:
+        await asyncio.sleep(MERGE_SECONDS)
+        try:
+            if not ai_configured(ai_settings()):
+                continue
+            with get_db() as db:
+                recent = [row[0] for row in db.execute(
+                    _WAITING_MESSAGES + " AND c.status='waiting' AND (s.ai_enabled=1 OR c.ai_waiting_for_agent=1) "
+                    "AND m.created_at >= datetime('now','localtime','-2 minutes') "
+                    "GROUP BY c.id HAVING latest_at <= datetime('now','localtime', ?) ORDER BY latest_at LIMIT 100",
+                    (f"-{MERGE_SECONDS + 1} seconds",))]
+            for cid in recent:
+                _schedule(cid, "ai_first", 0)
+        except Exception as exc:
+            log(f"AI 接待恢复检查异常：{type(exc).__name__}")
 
 
 async def _timeout_loop():
     while True:
         await asyncio.sleep(20)
         try:
-            minutes = ai_settings()["no_reply_minutes"]
+            settings = ai_settings()
             with get_db() as db:
-                ids = [r[0] for r in db.execute(
-                    "SELECT c.id FROM conversations c WHERE c.status != 'closed' AND EXISTS ("
-                    " SELECT 1 FROM chat_messages m WHERE m.conversation_id = c.id AND m.sender = 'visitor'"
-                    " AND m.id > c.auto_handled_upto"
-                    " AND m.id > COALESCE((SELECT MAX(id) FROM chat_messages a WHERE a.conversation_id = c.id AND a.sender = 'agent'), 0)"
-                    " AND m.created_at <= datetime('now','localtime', ?))",
-                    (f"-{minutes} minutes",))]
-            for cid in ids:
-                if cid not in _timers:
-                    await handle_unattended(cid, "timeout")
-        except Exception as e:  # noqa: BLE001
-            log(f"超时检查异常：{e!r}")
+                pending = rows(db.execute(
+                    _WAITING_MESSAGES + " GROUP BY c.id HAVING MIN(m.created_at)<=datetime('now','localtime', ?) LIMIT 100",
+                    (f"-{settings['no_reply_minutes']} minutes",)))
+            for row in pending:
+                _schedule(row["id"], "timeout_archive", 0)
+        except Exception as exc:
+            log(f"超时检查异常：{type(exc).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -751,5 +881,6 @@ def kb_clear(site_id: int):
 
 def setup():
     chat.visitor_message_hooks.append(on_visitor_message)
+    _spawn(_recover_ai_loop())
     _spawn(_timeout_loop())
     _spawn(_crawl_loop())

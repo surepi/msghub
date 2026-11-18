@@ -39,6 +39,23 @@
     } catch (_) { return null; }
   }
 
+  async function post(url, options) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, 20000);
+    try {
+      var response = await fetch(url, Object.assign({ signal: controller.signal }, options));
+      var result = await response.json().catch(function () { return {}; });
+      if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : typeof result.detail === "string" ? result.detail : "服务暂不可用，请稍后重试");
+      return result;
+    } catch (err) {
+      if (controller.signal.aborted) throw new Error("请求超时，请稍后重试");
+      if (err instanceof TypeError) throw new Error("网络连接失败，请检查网络后重试");
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   var css =
     ".mh-box{font:14px/1.55 system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;color:#1d2926;background:#fff;border:1px solid #dfe7e2;border-radius:8px;box-sizing:border-box;text-align:left;box-shadow:0 12px 36px rgba(19,42,36,.14)}" +
     ".mh-box *{box-sizing:border-box}" +
@@ -49,7 +66,9 @@
     // 对话
     ".mh-chat{display:flex;flex-direction:column;height:540px;max-height:calc(100vh - 112px);overflow:hidden}" +
     ".mh-inline.mh-chat{height:560px;max-width:560px;max-height:78vh}" +
-    "@media(max-width:480px){.mh-chat{height:min(620px,calc(100dvh - 98px));max-height:calc(100dvh - 98px)}}" +
+    "@media(max-width:480px){.mh-chat{height:min(620px,calc(100dvh - 98px));max-height:calc(100dvh - 98px)}.mh-float.mh-box:focus-within textarea,.mh-float.mh-box:focus-within input:not([type=file]){font-size:16px}}" +
+    ".mh-float.mh-box.mh-keyboard{bottom:calc(var(--mh-keyboard-inset) + 8px);max-height:calc(var(--mh-visible-height) - 16px)}" +
+    ".mh-form.mh-float{max-height:calc(100dvh - 100px);overflow:auto;overscroll-behavior:contain}" +
     ".mh-head{background:" + C + ";color:#fff;padding:14px 17px;box-shadow:0 2px 8px rgba(0,0,0,.08)}" +
     ".mh-head b{display:block;font-size:15px;line-height:1.4}.mh-head small{opacity:.92;font-size:12px}" +
     ".mh-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:1px;background:#9ca3af}.mh-dot.on{background:#4ade80}" +
@@ -64,6 +83,9 @@
     ".mh-row.me .mh-b.mh-img,.mh-b.mh-img{padding:4px;background:#fff;border-color:#e5e7eb;color:#6b7280}" +
     ".mh-t{display:block;font-size:11px;opacity:.6;margin-top:2px}" +
     ".mh-row.pending .mh-b{opacity:.6}.mh-row.failed .mh-b{background:#fee2e2;color:#991b1b;border-color:#fecaca}" +
+    ".mh-delivery{color:#6b7280;font-size:12px;margin:3px 2px;text-align:right;overflow-wrap:anywhere}" +
+    ".mh-delivery button,.mh-net button{border:1px solid currentColor;border-radius:5px;color:inherit;background:transparent;font:inherit;padding:4px 8px;margin-left:6px;cursor:pointer}" +
+    ".mh-net{flex-shrink:0;max-height:35%;overflow:auto}.mh-head,.mh-foot{flex-shrink:0}" +
     ".mh-foot{border-top:1px solid #e1e8e4;padding:10px;display:flex;gap:7px;align-items:flex-end;background:#fff}" +
     ".mh-foot textarea{flex:1;min-width:0;resize:vertical;border:1px solid #d1dbd6;border-radius:7px;padding:9px 10px;font:inherit;color:inherit;height:42px;max-height:120px;background:#fff;margin:0}" +
     ".mh-btn{border:0;border-radius:7px;background:" + C + ";color:#fff;font:600 14px/1 system-ui,sans-serif;padding:0 16px;height:42px;cursor:pointer}" +
@@ -71,10 +93,11 @@
     ".mh-icon{border:1px solid #d1dbd6;background:#fff;border-radius:7px;width:42px;height:42px;flex:none;cursor:pointer;font-size:18px;padding:0;color:#465750}" +
     ".mh-icon:focus-visible,.mh-btn:focus-visible,.mh-fab:focus-visible{outline:3px solid #9fe2d7;outline-offset:2px}" +
     ".mh-net{font-size:12px;color:#8b4f0a;background:#fff4d6;padding:7px 12px;display:none}" +
+    ".mh-thinking{flex:none;padding:5px 12px;color:#52665c;background:#f4f7f5;font-size:12px}.mh-thinking[hidden]{display:none}" +
     ".mh-off{font-size:12px;color:#72521d;background:#fff9e8;border-bottom:1px solid #f1dfb3;padding:8px 12px;display:none}" +
     // 资料表单
-    ".mh-pre{position:absolute;left:0;right:0;bottom:0;top:0;background:#fff;display:none;flex-direction:column;justify-content:center;padding:clamp(20px,6vw,32px);gap:11px}" +
-    ".mh-pre p{margin:0 0 4px;color:#4b5563;font-size:13px}" +
+    ".mh-pre{position:absolute;left:0;right:0;bottom:0;top:0;background:#fff;display:none;flex-direction:column;overflow:auto;overscroll-behavior:contain;padding:clamp(16px,5vw,28px);gap:11px}" +
+    ".mh-pre>*{flex-shrink:0}.mh-pre p{margin:auto 0 4px;color:#4b5563;font-size:13px}" +
     ".mh-pre input{width:100%;min-height:42px;padding:9px 10px;border:1px solid #d1dbd6;border-radius:7px;font:inherit;color:inherit;background:#fff}" +
     ".mh-pre .mh-err{color:#dc2626;font-size:12px;min-height:16px}" +
     // 表单模式
@@ -100,10 +123,33 @@
     function setOpen(open) {
       box.style.display = open ? (box.classList.contains("mh-chat") ? "flex" : "block") : "none";
       fab.textContent = open ? "×" : "✉";
+      fab.setAttribute("aria-expanded", String(open));
+      fab.setAttribute("aria-label", open ? "关闭咨询窗口" : cfg.title || "打开咨询窗口");
+      fitViewport();
       fab.appendChild(badge);
       onToggle && onToggle(open);
     }
+    function fitViewport() {
+      var viewport = window.visualViewport;
+      if (!viewport) return;
+      var inset = document.documentElement.clientHeight - viewport.height - viewport.offsetTop;
+      var keyboard = box.style.display !== "none" && viewport.scale < 1.1 && inset > 100;
+      box.classList.toggle("mh-keyboard", keyboard);
+      if (keyboard) {
+        box.style.setProperty("--mh-keyboard-inset", inset + "px");
+        box.style.setProperty("--mh-visible-height", viewport.height + "px");
+      }
+    }
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", fitViewport);
+      window.visualViewport.addEventListener("scroll", fitViewport);
+    }
+    fab.setAttribute("aria-expanded", "false");
+    fab.setAttribute("aria-label", cfg.title || "打开咨询窗口");
     fab.onclick = function () { setOpen(box.style.display === "none" || !box.style.display); };
+    box.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && !event.isComposing) { setOpen(false); fab.focus(); }
+    });
     document.body.appendChild(box);
     document.body.appendChild(fab);
     return { inline: false, badge: badge };
@@ -124,22 +170,22 @@
       '<input name="contact" placeholder="联系方式（邮箱 / 电话）" maxlength="200">' +
       '<textarea name="content" placeholder="请输入留言内容" maxlength="5000" required></textarea>' +
       '<input name="_hp" class="mh-hp" tabindex="-1" autocomplete="off">' +
-      '<button type="submit" class="mh-btn">提交留言</button><div class="mh-tip"></div>';
+      '<button type="submit" class="mh-btn">提交留言</button><div class="mh-tip" role="status"></div>';
     box.querySelector("h3").textContent = cfg.title || "给我们留言";
     var tip = box.querySelector(".mh-tip"), btn = box.querySelector("button");
     box.addEventListener("submit", function (e) {
       e.preventDefault();
+      if (btn.disabled) return;
       var body = { site_key: cfg.siteKey, page_url: location.href };
       new FormData(box).forEach(function (v, k) { body[k] = v; });
       btn.disabled = true;
       tip.style.color = "#6b7280"; tip.textContent = "提交中…";
-      fetch(api, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
-        .then(function (r) { return r.json(); })
+      post(api, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
         .then(function (r) {
           if (r.ok) { box.reset(); tip.style.color = "#16a34a"; tip.textContent = "提交成功，我们会尽快联系您！"; }
           else { tip.style.color = "#dc2626"; tip.textContent = r.error || r.detail || "提交失败"; }
         })
-        .catch(function () { tip.style.color = "#dc2626"; tip.textContent = "网络错误，请稍后再试"; })
+        .catch(function (err) { tip.style.color = "#dc2626"; tip.textContent = err.message; })
         .finally(function () { btn.disabled = false; });
     });
     ready(function () { mount(box); });
@@ -160,17 +206,32 @@
     var subText = el("span", null, "");
     sub.appendChild(dot); sub.appendChild(subText);
     head.appendChild(title); head.appendChild(sub);
-    var net = el("div", "mh-net", "连接中断，正在重连…");
+    var net = el("div", "mh-net");
+    var netText = el("span");
+    netText.setAttribute("role", "status");
+    var reconnect = el("button", null, "重新连接");
+    reconnect.type = "button";
+    net.appendChild(netText); net.appendChild(reconnect);
+    function showNetwork(text, canRetry) {
+      netText.textContent = text || "";
+      net.style.display = text ? "block" : "none";
+      reconnect.hidden = !canRetry;
+    }
     var off = el("div", "mh-off");
+    var thinking = el("div", "mh-thinking", "AI 助手正在查看您的消息…");
+    thinking.setAttribute("role", "status");
+    thinking.hidden = true;
     var list = el("div", "mh-list");
     var foot = el("div", "mh-foot");
     var picBtn = el("button", "mh-icon", "🖼");
     picBtn.type = "button"; picBtn.title = "发送图片";
+    picBtn.setAttribute("aria-label", "发送图片");
     var picInput = el("input");
     picInput.type = "file"; picInput.accept = "image/png,image/jpeg,image/gif,image/webp"; picInput.style.display = "none";
     var input = el("textarea");
     input.placeholder = "输入消息，Enter 发送";
     input.maxLength = 5000;
+    input.setAttribute("aria-label", "输入消息");
     var send = el("button", "mh-btn", "发送");
     send.type = "button";
     foot.appendChild(picBtn); foot.appendChild(picInput); foot.appendChild(input); foot.appendChild(send);
@@ -180,26 +241,34 @@
     pre.innerHTML = '<p>开始咨询前，请留下您的称呼和联系方式，方便客服及时联系您。</p>' +
       '<input name="name" placeholder="您的称呼" maxlength="100" autocomplete="name">' +
       '<input name="contact" placeholder="手机号或邮箱" maxlength="200" autocomplete="tel">' +
-      '<div class="mh-err"></div><button type="submit" class="mh-btn">开始咨询</button>';
-    var preErr = pre.querySelector(".mh-err");
+      '<div class="mh-err" role="status"></div><button type="submit" class="mh-btn">开始咨询</button>';
+    var preErr = pre.querySelector(".mh-err"), preButton = pre.querySelector("button");
 
     var body = el("div");
     body.style.cssText = "flex:1;display:flex;flex-direction:column;position:relative;min-height:0";
-    body.appendChild(off); body.appendChild(list); body.appendChild(pre);
+    body.appendChild(off); body.appendChild(list); body.appendChild(thinking); body.appendChild(pre);
     box.appendChild(head); box.appendChild(net); box.appendChild(body); box.appendChild(foot);
 
     var ws = null, connected = false, retry = 0, retryTimer = null, pingTimer = null;
     var isOpen = false, unread = 0, seen = {}, pending = {}, ui = null;
-    var site = null, profileOk = false;
+    var site = null, profileOk = false, unavailable = false;
+    var conversationStatus, waitingForHuman = false;
+    var drafts = [], profileTimer;
+    showPre(false);
+    showNetwork("正在连接客服…", false);
 
     function fmtTime(s) { return s ? String(s).slice(11, 16) : ""; }
     function scroll() { list.scrollTop = list.scrollHeight; }
     function abs(path) { return new URL(path, base).href; }
     function setSub(status) {
+      conversationStatus = status;
       var online = site && site.online;
-      dot.className = "mh-dot" + (online ? " on" : "");
+      var ai = site && site.ai_available && !waitingForHuman && status !== "closed" && status !== "active";
+      dot.className = "mh-dot" + (online || ai ? " on" : "");
       subText.textContent = status === "closed" ? "对话已结束，发送消息可重新开始"
-        : status === "active" ? "客服已接入" : online ? "客服在线" : "客服不在线，可先留言";
+        : status === "active" ? "客服已接入" : waitingForHuman ? "等待人工客服"
+        : ai ? "AI 助手可接待" : online ? "客服在线" : "客服不在线，可先留言";
+      off.style.display = !online && !ai && status !== "active" && off.textContent ? "block" : "none";
     }
 
     function bubble(sender, msgType, content, time) {
@@ -212,6 +281,7 @@
         img.src = content.indexOf("blob:") === 0 ? content : abs(content);
         img.alt = "图片";
         img.onload = scroll;
+        img.onerror = function () { img.replaceWith(el("span", null, "图片无法加载")); };
         img.onclick = function () { window.open(img.src, "_blank", "noopener"); };
         b.appendChild(img);
       } else {
@@ -230,8 +300,41 @@
 
     function showPre(show) {
       pre.style.display = show ? "flex" : "none";
-      input.disabled = picBtn.disabled = send.disabled = show;
-      if (show) setTimeout(function () { pre.querySelector("[name=name]").focus(); }, 0);
+      foot.style.display = show ? "none" : "flex";
+      send.disabled = picBtn.disabled = !connected || show;
+    }
+
+    function delivery(row, message, state, restore) {
+      row.className = "mh-row me " + state;
+      var label = row.querySelector(".mh-delivery") || el("div", "mh-delivery");
+      label.setAttribute("role", "status");
+      label.textContent = message;
+      if (restore) {
+        var button = el("button", null, "取回文字");
+        button.type = "button";
+        button.onclick = function () {
+          var draft = input.value + (input.value ? "\n" : "") + restore;
+          if (draft.length > input.maxLength) {
+            label.firstChild.textContent = "输入框字数不足，请先编辑当前草稿";
+            return;
+          }
+          input.value = draft;
+          input.focus();
+          button.remove();
+        };
+        label.appendChild(button);
+      }
+      row.appendChild(label);
+    }
+
+    function keepUnsent(cid, message) {
+      var p = pending[cid];
+      if (!p) return;
+      clearTimeout(p.timer);
+      delivery(p.row, message, "failed", p.msgType === "text" && p.content);
+      drafts.push(p.row);
+      if (drafts.length > 20) drafts.shift().remove();
+      delete pending[cid];
     }
 
     function bump() {
@@ -241,93 +344,162 @@
       ui.badge.style.display = "block";
     }
 
-    function wsSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+    function wsSend(obj) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      try { ws.send(JSON.stringify(obj)); return true; } catch (_) { return false; }
+    }
 
     function connect() {
-      if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+      if (unavailable || (ws && ws.readyState < WebSocket.CLOSING)) return;
       clearTimeout(retryTimer);
-      try { ws = new WebSocket(wsUrl.href); } catch (_) { return scheduleRetry(); }
-      ws.onopen = function () {
+      if (!navigator.onLine) { showNetwork("网络已断开，联网后将自动重连", true); return; }
+      showNetwork(site ? "连接中断，正在重连…" : "正在连接客服…", false);
+      var socket;
+      try { socket = new WebSocket(wsUrl.href); } catch (_) { scheduleRetry(); return; }
+      ws = socket;
+      var deadline = setTimeout(function () { socket.close(); }, 12000);
+      var startupError;
+      socket.onopen = function () {
         wsSend({ type: "hello", site_key: cfg.siteKey, token: store(TOKEN_KEY) || "", page_url: location.href });
       };
-      ws.onmessage = function (ev) {
+      socket.onmessage = function (ev) {
+        if (ws !== socket) return;
         var d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        if (d.type === "init") {
+        if (d.type === "pong") {
+          clearTimeout(deadline);
+        } else if (d.type === "init") {
+          clearTimeout(deadline);
           connected = true; retry = 0;
           site = d.site || {};
           profileOk = !site.require_contact || !!(d.profile && d.profile.name && d.profile.contact);
-          net.style.display = "none";
+          showNetwork(null);
           off.textContent = site.offline_text || "";
-          off.style.display = site.online ? "none" : "block";
+          thinking.hidden = true;
+          waitingForHuman = !!d.ai_handoff;
           list.textContent = ""; seen = {};
           bubble("agent", "text", (site.welcome && site.welcome !== "您好，请问有什么可以帮您？") ? site.welcome : cfg.welcome);
           (d.messages || []).forEach(render);
+          drafts.forEach(function (row) { list.appendChild(row); });
           Object.keys(pending).forEach(function (cid) { list.appendChild(pending[cid].row); });
           setSub(d.conversation && d.conversation.status);
           showPre(!profileOk);
+          preButton.disabled = false;
+          if (profileOk) preErr.textContent = "";
           scroll();
           flushPending();
           clearInterval(pingTimer);
-          pingTimer = setInterval(function () { wsSend({ type: "ping" }); }, 25000);
+          pingTimer = setInterval(function () {
+            if (wsSend({ type: "ping" })) deadline = setTimeout(function () { socket.close(); }, 12000);
+          }, 25000);
         } else if (d.type === "token") {
           store(TOKEN_KEY, d.token);
         } else if (d.type === "profile_ok") {
+          clearTimeout(profileTimer);
           profileOk = true;
+          preButton.disabled = false;
           showPre(false);
-          input.focus();
+          if (isOpen && matchMedia("(min-width: 481px)").matches) input.focus();
           flushPending();
         } else if (d.type === "msg") {
           var p = d.client_id && pending[d.client_id];
           if (p) {
+            clearTimeout(p.timer);
             seen[d.message.id] = 1;
             p.row.className = "mh-row me";
-            p.row.lastChild.appendChild(el("span", "mh-t", fmtTime(d.message.created_at)));
+            p.row.querySelector(".mh-delivery")?.remove();
+            p.row.querySelector(".mh-b").appendChild(el("span", "mh-t", fmtTime(d.message.created_at)));
             delete pending[d.client_id];
           } else {
             render(d.message);
             if (d.message.sender !== "visitor") bump();
           }
           scroll();
+        } else if (d.type === "ai_status") {
+          if (d.handoff && conversationStatus !== "active" && conversationStatus !== "closed") {
+            waitingForHuman = true;
+            setSub(conversationStatus);
+          }
+          thinking.hidden = !d.thinking || conversationStatus === "active" || conversationStatus === "closed";
         } else if (d.type === "status") {
+          waitingForHuman = false;
+          if (d.status === "active" || d.status === "closed") thinking.hidden = true;
           setSub(d.status);
         } else if (d.type === "error") {
-          if (pre.style.display === "flex" && !d.client_id) { preErr.textContent = d.error; return; }
+          if (!connected) { startupError = d.error; return; }
           if (d.need_profile) { profileOk = false; showPre(true); }
           var f = d.client_id && pending[d.client_id];
           if (f) {
-            if (d.need_profile) { f.sent = false; return; }   // 填完资料后自动重发
-            f.row.className = "mh-row me failed"; f.row.title = d.error; delete pending[d.client_id];
+            clearTimeout(f.timer);
+            if (d.need_profile) {
+              f.sent = false;
+              delivery(f.row, "填写资料后发送", "pending");
+            } else {
+              keepUnsent(d.client_id, d.error);
+            }
+          } else if (pre.style.display === "flex") {
+            clearTimeout(profileTimer);
+            preButton.disabled = false;
+            preErr.textContent = d.error;
+          } else {
+            bubble("system", "text", d.error);
           }
-          bubble("system", "text", d.error);
           scroll();
         }
       };
-      ws.onclose = function (ev) {
+      socket.onclose = function (ev) {
+        clearTimeout(deadline);
+        if (ws !== socket) return;
+        ws = null;
         connected = false;
+        thinking.hidden = true;
         clearInterval(pingTimer);
-        // 已发出但未确认的消息无法判断是否送达，标记为失败让访客知道
+        clearTimeout(profileTimer);
+        showPre(site && !profileOk);
+        if (preButton.disabled) {
+          preButton.disabled = false;
+          preErr.textContent = "连接中断，恢复后可再次提交";
+        }
         Object.keys(pending).forEach(function (cid) {
-          var p = pending[cid];
-          if (p.sent) { p.row.className = "mh-row me failed"; p.row.title = "可能未发送成功"; delete pending[cid]; }
+          if (pending[cid].sent) keepUnsent(cid, "送达未确认，请先查看聊天记录");
         });
-        if (ev.code === 4403) { net.textContent = "该网站的在线客服暂不可用"; net.style.display = "block"; return; }
-        if (isOpen || store(TOKEN_KEY)) { net.style.display = "block"; scheduleRetry(); }
+        if (ev.code === 4403) {
+          unavailable = true;
+          showNetwork(startupError || "该网站的在线客服暂不可用", true);
+          return;
+        }
+        if (isOpen || store(TOKEN_KEY)) scheduleRetry();
       };
     }
     function scheduleRetry() {
       clearTimeout(retryTimer);
-      var delay = Math.min(30000, 1000 * Math.pow(2, retry++));
-      retryTimer = setTimeout(connect, delay);
+      showNetwork(navigator.onLine ? "连接中断，正在重连…" : "网络已断开，联网后将自动重连", true);
+      if (navigator.onLine) retryTimer = setTimeout(connect, Math.min(30000, 1000 * Math.pow(2, retry++)));
     }
+    reconnect.onclick = function () {
+      unavailable = false;
+      connect();
+    };
+    window.addEventListener("online", function () {
+      if (isOpen || store(TOKEN_KEY)) connect();
+    });
+    window.addEventListener("offline", function () {
+      if (!isOpen && !ws) return;
+      ws?.close();
+      showNetwork("网络已断开，联网后将自动重连", true);
+    });
 
     function flushPending() {
       if (!connected || !profileOk) return;
       Object.keys(pending).forEach(function (cid) {
         var p = pending[cid];
-        if (!p.sent && p.content) {
-          wsSend({ type: "msg", msg_type: p.msgType, content: p.content, client_id: cid, page_url: location.href });
+        if (!p.sent && p.content && wsSend({ type: "msg", msg_type: p.msgType, content: p.content, client_id: cid, page_url: location.href })) {
           p.sent = true;
+          delivery(p.row, "发送中…", "pending");
+          p.timer = setTimeout(function () {
+            keepUnsent(cid, "送达未确认，请先查看聊天记录");
+            if (ws) ws.close();
+          }, 15000);
         }
       });
     }
@@ -336,41 +508,44 @@
 
     function doSend() {
       var text = input.value.trim();
-      if (!text) return;
+      if (!text || !connected || !profileOk) return;
       var cid = newCid();
       pending[cid] = { msgType: "text", content: text, row: bubble("visitor", "text", text), sent: false };
       pending[cid].row.className = "mh-row me pending";
       input.value = "";
       scroll();
-      if (connected) flushPending(); else connect();
+      flushPending();
     }
 
     function sendImage(file) {
-      if (!file || !/^image\//.test(file.type)) return;
+      if (!file || !connected || !profileOk || !/^image\//.test(file.type)) return;
       if (file.size > 5 * 1024 * 1024) { bubble("system", "text", "图片不能超过 5MB"); scroll(); return; }
       var token = store(TOKEN_KEY);
       if (!token) { bubble("system", "text", "请先发送一条文字消息，再发送图片"); scroll(); return; }
       var cid = newCid();
-      var p = pending[cid] = { msgType: "image", content: "", row: bubble("visitor", "image", URL.createObjectURL(file)), sent: false };
-      p.row.className = "mh-row me pending";
+      var preview = URL.createObjectURL(file);
+      var p = pending[cid] = { msgType: "image", content: "", row: bubble("visitor", "image", preview), sent: false };
+      delivery(p.row, "正在上传图片…", "pending");
       scroll();
       var fd = new FormData();
       fd.append("site_key", cfg.siteKey);
       fd.append("token", token);
       fd.append("file", file);
-      fetch(uploadUrl, { method: "POST", body: fd })
-        .then(function (r) { return r.json(); })
+      post(uploadUrl, { method: "POST", body: fd })
         .then(function (r) {
           if (!r.url) throw new Error(r.error || "上传失败");
           p.content = r.url;
-          if (connected) flushPending(); else connect();
+          var img = p.row.querySelector("img");
+          if (img) img.src = abs(r.url);
+          if (connected) flushPending();
+          else { delivery(p.row, "等待连接后发送…", "pending"); connect(); }
         })
         .catch(function (err) {
-          p.row.className = "mh-row me failed"; p.row.title = err.message;
-          delete pending[cid];
-          bubble("system", "text", "图片发送失败：" + err.message);
+          p.row.querySelector("img")?.replaceWith(el("span", null, "图片未发送"));
+          keepUnsent(cid, "图片发送失败 · " + err.message);
           scroll();
-        });
+        })
+        .finally(function () { URL.revokeObjectURL(preview); });
     }
 
     send.onclick = doSend;
@@ -388,6 +563,7 @@
     picInput.onchange = function () { sendImage(picInput.files[0]); picInput.value = ""; };
     pre.addEventListener("submit", function (e) {
       e.preventDefault();
+      if (preButton.disabled) return;
       preErr.textContent = "";
       var name = pre.querySelector("[name=name]").value.trim();
       var contact = pre.querySelector("[name=contact]").value.trim();
@@ -396,7 +572,16 @@
         preErr.textContent = "请填写正确的手机号或邮箱"; return;
       }
       if (!connected) { preErr.textContent = "正在连接，请稍候再试"; connect(); return; }
-      wsSend({ type: "profile", name: name, contact: contact });
+      if (wsSend({ type: "profile", name: name, contact: contact })) {
+        preButton.disabled = true;
+        preErr.textContent = "正在保存…";
+        profileTimer = setTimeout(function () {
+          preButton.disabled = false;
+          preErr.textContent = "保存结果未确认，请稍后重试";
+        }, 12000);
+      } else {
+        preErr.textContent = "连接中断，恢复后可再次提交";
+      }
     });
 
     bubble("agent", "text", cfg.welcome);
@@ -407,7 +592,7 @@
           unread = 0;
           if (ui && ui.badge) ui.badge.style.display = "none";
           connect();
-          setTimeout(function () { scroll(); if (profileOk) input.focus(); }, 0);
+          setTimeout(scroll, 0);
         }
       });
       if (ui.inline) { isOpen = true; connect(); }

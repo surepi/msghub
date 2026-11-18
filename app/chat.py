@@ -43,6 +43,7 @@ from .db import ADMIN_MESSAGE_SQL, get_db, rows
 router = APIRouter()
 admin = Depends(auth.require_admin)
 
+CONVERSATION_CLOSED_TEXT = "对话已结束。如还有问题，直接发送消息即可重新联系客服。"
 HELLO_TIMEOUT = 10
 HISTORY_LIMIT = 100
 SENDERS = ("visitor", "agent", "ai", "system")
@@ -115,11 +116,14 @@ def site_online(site: dict) -> bool:
 
 
 def site_public_config(site: dict) -> dict:
+    from .auto import ai_ready
+
     return {
         "welcome": site.get("welcome") or DEFAULT_WELCOME,
         "offline_text": site.get("offline_text") or DEFAULT_OFFLINE,
         "require_contact": bool(site.get("require_contact", 1)),
         "online": site_online(site),
+        "ai_available": ai_ready(site),
     }
 
 
@@ -231,14 +235,17 @@ def history(conv_id: int, limit: int = HISTORY_LIMIT) -> list[dict]:
     return [_msg_out(m) for m in items]
 
 
-def add_message(conv_id: int, sender: str, content: str, page_url: str = "", msg_type: str = "text", *, db=None) -> dict:
+def add_message(conv_id: int, sender: str, content: str, page_url: str = "", msg_type: str = "text", *,
+                db=None, queue_qq: bool = False) -> dict:
     """写入一条消息并更新会话状态：
     访客消息 → 未读 +1，已结束的会话重新打开为 waiting；
     客服消息 → 未读清零，会话变为 active；AI / 系统消息不改状态。"""
     with (get_db() if db is None else nullcontext(db)) as db:
         cur = db.execute(
-            "INSERT INTO chat_messages (conversation_id, sender, content, msg_type) VALUES (?,?,?,?)",
-            (conv_id, sender, content, msg_type),
+            "INSERT INTO chat_messages (conversation_id, sender, content, msg_type, qq_state) "
+            "VALUES (?,?,?,?,CASE WHEN ? AND EXISTS (SELECT 1 FROM qq_agent WHERE id=1 AND openid!='') "
+            "THEN 'pending' ELSE '' END)",
+            (conv_id, sender, content, msg_type, sender == "visitor" and queue_qq),
         )
         msg = dict(db.execute("SELECT * FROM chat_messages WHERE id = ?", (cur.lastrowid,)).fetchone())
         preview = preview_of(msg_type, content)
@@ -253,7 +260,7 @@ def add_message(conv_id: int, sender: str, content: str, page_url: str = "", msg
         elif sender == "agent":
             db.execute(
                 "UPDATE conversations SET last_msg_at = ?, last_preview = ?, unread = 0, status = 'active', "
-                "closed_at = NULL WHERE id = ?",
+                "closed_at = NULL, ai_waiting_for_agent=0 WHERE id = ?",
                 (msg["created_at"], preview, conv_id),
             )
         elif sender == "ai":
@@ -289,13 +296,15 @@ async def set_conversation_status(conv_id: int, status: str):
     with get_db() as db:
         if status == "closed":
             db.execute(
-                "UPDATE conversations SET status = 'closed', closed_at = datetime('now','localtime') WHERE id = ?",
-                (conv_id,),
+                "UPDATE conversations SET status='closed', closed_at=datetime('now','localtime'), ai_waiting_for_agent=0, "
+                "auto_handled_upto=MAX(auto_handled_upto, COALESCE((SELECT MAX(id) FROM chat_messages "
+                "WHERE conversation_id=? AND sender='visitor'),0)) WHERE id=?",
+                (conv_id, conv_id),
             )
         else:
-            db.execute("UPDATE conversations SET status = 'waiting', closed_at = NULL WHERE id = ?", (conv_id,))
+            db.execute("UPDATE conversations SET status = 'waiting', closed_at = NULL, ai_waiting_for_agent=0 WHERE id = ?", (conv_id,))
     if status == "closed":
-        await post_message(conv_id, "system", "对话已结束。如还有问题，直接发送消息即可重新联系客服。")
+        await post_message(conv_id, "system", CONVERSATION_CLOSED_TEXT)
     await hub.to_visitor(conv_id, {"type": "status", "status": status})
     await hub.to_admins({"type": "conv", "conversation": conv_summary(conv_id)})
 
@@ -316,6 +325,8 @@ def _profile_complete(visitor: dict | None) -> bool:
 
 @router.websocket("/api/chat/ws")
 async def visitor_ws(ws: WebSocket):
+    from . import qq
+
     await ws.accept()
 
     async def fail(error: str, code: int = 4400):
@@ -350,6 +361,7 @@ async def visitor_ws(ws: WebSocket):
         "site": site_public_config(site),
         "profile": _profile(visitor),
         "conversation": {"id": conv["id"], "status": conv["status"]} if conv else None,
+        "ai_handoff": bool(conv and conv["ai_waiting_for_agent"]),
         "messages": history(conv["id"]) if conv else [],
     })
 
@@ -423,7 +435,7 @@ async def visitor_ws(ws: WebSocket):
 
             msg_page = str(data.get("page_url", ""))[:500] or page_url
             was_closed = conv_summary(conv["id"])["status"] == "closed"
-            msg = add_message(conv["id"], "visitor", content, msg_page, msg_type)
+            msg = add_message(conv["id"], "visitor", content, msg_page, msg_type, queue_qq=qq.ENABLED)
             await broadcast_message(conv["id"], msg, client_id)
             if was_closed:
                 await hub.to_visitor(conv["id"], {"type": "status", "status": "waiting"})

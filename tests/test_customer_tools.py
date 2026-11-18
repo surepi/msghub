@@ -631,16 +631,25 @@ class CustomerToolsTests(unittest.TestCase):
         Handler.fail=False;Handler.answer='套餐每月 100 元。'
         self.request('PUT','/api/admin/ai/settings',{'enabled':True,'base_url':f'http://127.0.0.1:{stub.server_port}/v1','model':'fake-model','prompt':'private-prompt'})
         site=self.sites[0]
-        self.request('PUT',f"/api/admin/sites/{site['id']}",{'name':site['name'],'require_contact':False,'ai_enabled':True,'work_hours':{'days':[1,2,3,4,5,6,7],'start':'00:00','end':'00:00'}})
+        self.request('PUT',f"/api/admin/sites/{site['id']}",{'name':site['name'],'require_contact':False,'ai_enabled':True,'work_hours':None})
         with connect(self.ws_base+'/api/admin/ws') as admin_ws,connect(self.ws_base+'/api/chat/ws') as visitor:
             admin_ws.send(json.dumps({'type':'auth','token':self.token}));self.assertEqual(json.loads(admin_ws.recv())['type'],'ready')
-            visitor.send(json.dumps({'type':'hello','site_key':site['site_key']}));visitor.recv()
+            visitor.send(json.dumps({'type':'hello','site_key':site['site_key']}))
+            public_site=json.loads(visitor.recv())['site']
+            self.assertTrue(public_site['online'])
+            self.assertTrue(public_site['ai_available'])
+            sent_at=time.monotonic()
             visitor.send(json.dumps({'type':'msg','content':'套餐 pricing'}))
+            visitor.send(json.dumps({'type':'msg','content':'请问月费'}))
             visitor_token=None;events=[]
             while True:
                 event=json.loads(visitor.recv(timeout=6));events.append(event)
                 if event['type']=='token': visitor_token=event['token']
                 if event['type']=='msg' and event['message']['sender']=='ai': break
+            self.assertLess(time.monotonic()-sent_at,8)
+            self.assertTrue(any(e['type']=='ai_status' and e['thinking'] for e in events))
+            self.assertTrue(any(e['type']=='ai_status' and not e['thinking'] for e in events))
+            self.assertIn('套餐 pricing\n请问月费',requests[-1]['messages'][-1]['content'])
             self.assertNotIn('ai_decision_changed',str(events))
             self.assertNotIn('sources',str(events));self.assertNotIn('private-prompt',str(events))
             for _ in range(20):
@@ -650,6 +659,8 @@ class CustomerToolsTests(unittest.TestCase):
             cid,did=event['conversation_id'],event['decision_id']
             detail=self.request('GET',f'/api/admin/conversations/{cid}/ai-decisions/{did}')[1]
             self.assertEqual(detail['outcome'],'answered');self.assertEqual(detail['source_count'],1)
+            self.assertEqual(detail['trigger'],'AI 快速接待')
+            self.assertEqual(detail['question'],'套餐 pricing\n请问月费')
             with self.assertRaises(TimeoutError): visitor.recv(timeout=.2)
         with connect(self.ws_base+'/api/chat/ws') as visitor:
             visitor.send(json.dumps({'type':'hello','site_key':site['site_key'],'token':visitor_token}))
@@ -679,8 +690,6 @@ class CustomerToolsTests(unittest.TestCase):
         self.addCleanup(self.request,'PUT','/api/admin/ai/settings',{'enabled':False,'base_url':'','api_key':'','model':'','prompt':''})
         self.request('PUT','/api/admin/ai/settings',{'enabled':True,'base_url':f'http://127.0.0.1:{stub.server_port}/v1','api_key':'summary-provider-secret','model':'fake-summary','prompt':'private-summary-prompt'})
         site=self.sites[0]
-        # Keep automatic processing dormant for this manual API test.
-        self.request('PUT',f"/api/admin/sites/{site['id']}",{'name':site['name'],'require_contact':False,'ai_enabled':True,'work_hours':None})
         with connect(self.ws_base+'/api/chat/ws') as visitor,connect(self.ws_base+'/api/admin/ws') as admin_ws:
             admin_ws.send(json.dumps({'type':'auth','token':self.token}));admin_ws.recv()
             visitor.send(json.dumps({'type':'hello','site_key':site['site_key']}));visitor.recv()
@@ -691,6 +700,10 @@ class CustomerToolsTests(unittest.TestCase):
                 if e['type']=='token': visitor_token=e['token']
                 if e['type']=='msg': break
             cid=self.request('GET',f"/api/admin/conversations?site_id={site['id']}")[1]['items'][0]['id']
+            # These API fixtures belong to a human-managed conversation.
+            with sqlite3.connect(Path(self.tmp.name)/"msghub.db") as db:
+                db.execute("UPDATE conversations SET status='active' WHERE id=?", (cid,))
+            self.request('PUT',f"/api/admin/sites/{site['id']}",{'name':site['name'],'require_contact':False,'ai_enabled':True,'work_hours':None})
             path=f'/api/admin/conversations/{cid}/summary'
             self.request('POST',f'/api/admin/conversations/{cid}/notes',{'content':'summary-internal-note'})
             for method in ['GET','POST']: self.assertEqual(self.request(method,path,authenticated=False)[0],401)
@@ -748,7 +761,6 @@ class CustomerToolsTests(unittest.TestCase):
         settings={'enabled':True,'triage_enabled':False,'auto_tags':False,'base_url':f'http://127.0.0.1:{stub.server_port}/v1','api_key':'triage-http-secret','model':'fake-classifier','prompt':'private-triage-prompt'}
         self.request('PUT','/api/admin/ai/settings',settings)
         site=self.sites[0]
-        self.request('PUT',f"/api/admin/sites/{site['id']}",{'name':site['name'],'require_contact':False,'ai_enabled':True,'work_hours':None})
         with connect(self.ws_base+'/api/chat/ws') as visitor,connect(self.ws_base+'/api/admin/ws') as admin_ws:
             admin_ws.send(json.dumps({'type':'auth','token':self.token}));admin_ws.recv()
             visitor.send(json.dumps({'type':'hello','site_key':site['site_key']}));visitor.recv()
@@ -759,6 +771,10 @@ class CustomerToolsTests(unittest.TestCase):
                 if e['type']=='token': visitor_token=e['token']
                 if e['type']=='msg': break
             cid=self.request('GET',f"/api/admin/conversations?site_id={site['id']}")[1]['items'][0]['id']
+            # These API fixtures belong to a human-managed conversation.
+            with sqlite3.connect(Path(self.tmp.name)/"msghub.db") as db:
+                db.execute("UPDATE conversations SET status='active' WHERE id=?", (cid,))
+            self.request('PUT',f"/api/admin/sites/{site['id']}",{'name':site['name'],'require_contact':False,'ai_enabled':True,'work_hours':None})
             path=f'/api/admin/conversations/{cid}/triage'
             self.assertIsNone(self.request('GET',path)[1]['item'])
             for method in ('GET','POST'): self.assertEqual(self.request(method,path,authenticated=False)[0],401)

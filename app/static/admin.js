@@ -30,15 +30,71 @@
   }
 
   async function api(path, opts = {}) {
-    const res = await fetch(path, {
-      ...opts,
-      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token, ...(opts.headers || {}) },
-      body: opts.body && typeof opts.body !== "string" ? JSON.stringify(opts.body) : opts.body,
-    });
-    if (res.status === 401 && !path.endsWith("/login")) { logout(); throw new Error("请重新登录"); }
-    const data = res.headers.get("content-type")?.includes("json") ? await res.json() : await res.text();
-    if (!res.ok) throw new Error((data && data.detail) || "请求失败");
-    return data;
+    const requestToken = token;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), opts.timeout ?? (opts.method && opts.method !== "GET" ? 60000 : 15000));
+    try {
+      const form = opts.body instanceof FormData;
+      const res = await fetch(path, {
+        method: opts.method,
+        headers: { ...(form ? {} : {"Content-Type":"application/json"}), Authorization: "Bearer " + requestToken, ...opts.headers },
+        body: form || typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body),
+        signal: controller.signal,
+      });
+      if (res.status === 401 && !path.endsWith("/login") && requestToken === token) {
+        logout();
+        $("#loginErr").textContent = "登录已过期，请重新登录";
+        throw new Error("请重新登录");
+      }
+      const data = res.headers.get("content-type")?.includes("json") ? await res.json() : null;
+      if (!res.ok) throw new Error(typeof data?.detail === "string" ? data.detail : "请求失败，请稍后再试");
+      return data;
+    } catch (err) {
+      if (controller.signal.aborted) throw new Error("请求超时，请检查网络后重试");
+      if (err instanceof TypeError) throw new Error("无法连接服务器，请检查网络后重试");
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const panelRequests = new WeakMap();
+  function panelStatus(panel, text, retry, loading = false) {
+    const box = document.createElement(panel.tagName === "TBODY" ? "tr" : "div");
+    const content = box.tagName === "TR" ? box.insertCell() : box;
+    if (content !== box) content.colSpan = 6;
+    content.className = "panel-status";
+    const message = document.createElement("span");
+    message.setAttribute("role", retry ? "alert" : "status");
+    message.textContent = text;
+    content.append(message);
+    if (retry) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "btn sm";
+      button.textContent = "重新加载";
+      button.onclick = () => Promise.resolve(retry()).catch(() => {});
+      content.append(button);
+    }
+    panel.replaceChildren(box);
+    panel.setAttribute("aria-busy", String(loading));
+  }
+
+  async function panelData(selector, label, read, retry, current = () => true, quiet = false) {
+    const panel = $(selector);
+    const request = {};
+    const session = token;
+    panelRequests.set(panel, request);
+    const active = () => !!session && session === token && panelRequests.get(panel) === request && current();
+    if (!quiet || !panel.children.length) panelStatus(panel, "正在加载" + label + "…", null, true);
+    try {
+      const data = await read();
+      return active() ? data : undefined;
+    } catch (err) {
+      if (active()) panelStatus(panel, label + "加载失败 · " + err.message, retry);
+    } finally {
+      if (panelRequests.get(panel) === request) panel.setAttribute("aria-busy", "false");
+    }
   }
 
   // ---------- 登录 ----------
@@ -60,20 +116,32 @@
     $$(".drawer").forEach((d) => d.classList.add("hidden"));
     clearTimeout(chat.timer);
     clearInterval(chat.ping);
-    if (chat.ws) chat.ws.close();
+    const ws = chat.ws;
+    chat.ws = null;
+    ws?.close();
+    chat.retry = 0;
+    chat.wasLive = false;
+    chat.recovering = false;
+    chat.missed = [];
+    setLive("connecting");
     try { localStorage.removeItem("msghub_token"); } catch (_) {}
     showLogin();
   }
   $("#loginForm").addEventListener("submit", async (e) => {
     e.preventDefault();
-    $("#loginErr").textContent = "";
+    const button = $('button[type="submit"]', e.target);
+    if (button.disabled) return;
+    button.disabled = true;
+    $("#loginErr").textContent = "正在登录…";
     try {
       const r = await api("/api/admin/login", { method: "POST", body: { password: e.target.password.value } });
       token = r.token;
       try { localStorage.setItem("msghub_token", token); } catch (_) {}
       e.target.reset();
+      $("#loginErr").textContent = "";
       boot();
     } catch (err) { $("#loginErr").textContent = err.message; }
+    finally { button.disabled = false; }
   });
   $("#logout").onclick = logout;
 
@@ -92,22 +160,25 @@
     $$(".top nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === v));
     ["chats", "messages", "sites", "ai", "replies"].forEach((n) => $("#view-" + n).classList.toggle("hidden", v !== n));
     document.body.dataset.view = v;
-    if (v === "sites") { renderSites(); loadQQ(); }
+    if (!token) return;
+    if (v === "sites") { loadSites(); loadQQ(); }
     if (v === "ai") loadAI();
     if (v === "messages") loadMessages().catch((err) => toast(err.message));
-    if (v === "replies") {
-      const sel = $("#replyScope"), value = sel.value;
-      sel.innerHTML = '<option value="">全部范围</option><option value="global">仅全局</option>' +
-        state.sites.map((s) => `<option value="${s.id}">${esc(s.name)}（含全局）</option>`).join("");
-      sel.value = value;
-      loadQuickReplies().catch((err) => toast(err.message));
-    }
+    if (v === "replies") { renderReplyScopes(); loadQuickReplies(); }
   }
   window.addEventListener("hashchange", route);
 
+  function renderReplyScopes() {
+    const sel = $("#replyScope"), value = sel.value;
+    sel.innerHTML = '<option value="">全部范围</option><option value="global">仅全局</option>' +
+      state.sites.map((s) => `<option value="${s.id}">${esc(s.name)}（含全局）</option>`).join("");
+    sel.value = [...sel.options].some((o) => o.value === value) ? value : "";
+  }
+
   // ---------- 统计 ----------
   async function loadStats() {
-    const s = await api("/api/admin/stats");
+    const s = await panelData("#stats", "统计", () => api("/api/admin/stats"), loadStats, undefined, true);
+    if (!s) return;
     const cells = [
       ["待回复对话", s.conv_waiting], ["进行中对话", s.conv_open],
       ["今日新增留言", s.today], ["未读留言", s.by_status.new], ["接入站点", s.sites],
@@ -121,7 +192,10 @@
 
   // ---------- 站点 ----------
   async function loadSites() {
-    state.sites = await api("/api/admin/sites");
+    const sites = await panelData("#siteList", "站点列表", () => api("/api/admin/sites"), loadSites);
+    if (!sites) return;
+    state.sites = sites;
+    renderSites();
     const sel = $("#fSite"), cur = sel.value;
     sel.innerHTML = '<option value="">全部站点</option>' +
       state.sites.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join("");
@@ -130,6 +204,13 @@
     convSite.innerHTML = '<option value="">全部站点</option>' +
       state.sites.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join("");
     convSite.value = state.sites.some((s) => String(s.id) === oldSite) ? oldSite : "";
+    renderReplyScopes();
+    const kbSite = $("#kbSite").value;
+    siteOptions($("#aiTestSite"), false, $("#aiTestSite").value || undefined);
+    siteOptions($("#qaSite"), true, $("#qaSite").value);
+    siteOptions($("#kbSite"), false, kbSite || undefined);
+    if (kbSite !== $("#kbSite").value && document.body.dataset.view === "ai") loadKB();
+
   }
 
   function snippets(s) {
@@ -248,24 +329,25 @@
     return p;
   }
 
-  async function loadMessages() {
+  async function loadMessages(quiet = false) {
     const seq = ++state.listSeq;
     const p = filters();
     p.set("page", state.page); p.set("size", state.size);
-    const r = await api("/api/admin/messages?" + p);
-    if (seq !== state.listSeq || !token) return;
+    if (!quiet) { $("#pager").textContent = ""; $("#chkAll").checked = false; }
+    const r = await panelData("#msgBody", "留言", () => api("/api/admin/messages?" + p), loadMessages, () => seq === state.listSeq, quiet);
+    if (!r) { if (seq === state.listSeq && $("#msgBody .panel-status")) $("#pager").textContent = ""; return; }
     const pages = Math.max(1, Math.ceil(r.total / r.size));
     if (state.page > pages) { state.page = pages; return loadMessages(); }
     state.items = r.items;
     $("#chkAll").checked = false;
     $("#msgBody").innerHTML = r.items.length ? r.items.map((m) => `
       <tr data-id="${m.id}" class="${m.status === "new" ? "unread" : ""}">
-        <td class="w-chk"><input type="checkbox" class="chk" value="${m.id}"></td>
-        <td class="nowrap">${esc(m.site_name)}<br><span class="message-source muted">${m.linked_conversation_id ? `来自对话 #${m.linked_conversation_id}` : m.conversation_id ? `来源对话 #${m.conversation_id} 不可用` : "独立留言"}</span></td>
-        <td>${esc(m.name) || '<span class="muted">匿名</span>'}<br><span class="muted">${esc(m.contact)}</span></td>
+        <td class="w-chk"><input type="checkbox" class="chk" value="${m.id}" aria-label="选择留言 #${m.id}"></td>
+        <td class="nowrap message-site">${esc(m.site_name)}<br><span class="message-source muted">${m.linked_conversation_id ? `来自对话 #${m.linked_conversation_id}` : m.conversation_id ? `来源对话 #${m.conversation_id} 不可用` : "独立留言"}</span></td>
+        <td class="message-visitor">${esc(m.name) || '<span class="muted">匿名</span>'}<br><span class="muted">${esc(m.contact)}</span></td>
         <td class="clip">${esc(m.content)}</td>
         <td><span class="tag ${m.status}">${STATUS[m.status]}</span></td>
-        <td class="nowrap muted">${esc(m.created_at)}</td>
+        <td class="nowrap muted message-time">${esc(m.created_at)}</td>
       </tr>`).join("") : '<tr><td colspan="6" class="empty">暂无留言</td></tr>';
     $("#pager").innerHTML = `<span class="muted">共 ${r.total} 条</span>
       <button class="btn sm" ${state.page <= 1 ? "disabled" : ""} data-p="${state.page - 1}">上一页</button>
@@ -319,8 +401,11 @@
 
   async function openMessage(id, fromRelated = false) {
     const seq = ++state.messageSeq;
-    const m = await api(`/api/admin/messages/${id}`);
-    if (seq !== state.messageSeq || !token) return;
+    $("#drawer").classList.remove("hidden");
+    $("#relatedDrawer").classList.add("hidden");
+    const m = await panelData("#drawerBody", "留言详情", () => api(`/api/admin/messages/${id}`),
+      () => openMessage(id, fromRelated), () => seq === state.messageSeq);
+    if (!m) return;
     state.messageId = id;
     $("#relatedDrawer").classList.add("hidden");
     $("#drawerBody").innerHTML = `
@@ -408,11 +493,11 @@
     const seq = ++related.seq;
     $("#relatedDrawer").classList.remove("hidden");
     $("#relatedTitle").textContent = `对话 #${convId} 的关联留言`;
-    $("#relatedList").textContent = "正在加载…";
     $("#relatedPager").innerHTML = "";
     try {
-      const r = await api(`/api/admin/conversations/${convId}/inbox-messages?page=${related.page}&size=10`);
-      if (seq !== related.seq || !token || $("#relatedDrawer").classList.contains("hidden")) return;
+      const r = await panelData("#relatedList", "关联留言", () => api(`/api/admin/conversations/${convId}/inbox-messages?page=${related.page}&size=10`),
+        () => showRelated(convId, false), () => seq === related.seq);
+      if (!r) return;
       const pages = Math.max(1, Math.ceil(r.total / r.size));
       if (related.page > pages) { related.page = pages; return showRelated(convId, false); }
       $("#relatedList").innerHTML = r.items.length ? r.items.map((m) => `
@@ -471,7 +556,8 @@
   // ---------- 快捷回复 ----------
   let quickReplies = [], editingReply = null;
   async function loadQuickReplies() {
-    const items = await api("/api/admin/quick-replies");
+    const items = await panelData("#quickReplyList", "快捷回复", () => api("/api/admin/quick-replies"), loadQuickReplies, undefined, true);
+    if (!items) return;
     quickReplies = items;
     const scope = $("#replyScope").value;
     const visible = items.filter((q) => !scope || (scope === "global" ? q.site_id === null : !q.site_id || q.site_id === +scope));
@@ -543,9 +629,12 @@
   }
 
   async function loadAI() {
-    let s;
-    try { s = await api("/api/admin/ai/settings"); } catch (err) { return toast(err.message); }
     const f = $("#aiForm");
+    const save = $('button[type="submit"]', f);
+    save.disabled = true;
+    const s = await panelData("#aiState", "AI 设置", () => api("/api/admin/ai/settings"), loadAI);
+    if (!s) return;
+    save.disabled = false;
     f.enabled.checked = s.enabled;
     f.triage_enabled.checked = s.triage_enabled; f.auto_tags.checked = s.auto_tags;
     f.base_url.value = s.base_url;
@@ -712,7 +801,7 @@
         ${r.items.length ? r.items.map((d) => `<article class="ai-source"><b>${AI_OUTCOME[d.outcome]} · ${esc(d.created_at)}</b><p>${esc(d.reason)}</p>
           <p class="muted">${esc(d.trigger)} · ${d.source_count} 条参考资料 · ${esc(d.model || "未调用模型")}</p><button class="btn sm" data-ai-detail="${d.id}">查看资料与依据 #${d.id}</button></article>`).join("") : '<p class="empty">暂无处理记录。此条历史消息或通知尚未保存资料快照。</p>'}
         <div class="pager"><span>${aiLog.page}/${pages} · 共 ${r.total} 条</span><button class="btn sm" data-ai-page="${aiLog.page-1}" ${aiLog.page <= 1 ? "disabled" : ""}>上一页</button><button class="btn sm" data-ai-page="${aiLog.page+1}" ${aiLog.page >= pages ? "disabled" : ""}>下一页</button></div>`;
-    } catch (err) { if (seq === aiLog.seq) $("#aiDecisionBody").textContent = "加载失败：" + err.message; }
+    } catch (err) { if (seq === aiLog.seq && token) panelStatus($("#aiDecisionBody"), "加载失败 · " + err.message, () => loadAIDecisions(autoDetail)); }
   }
   async function loadAIDecisionDetail(id) {
     const seq = ++aiLog.seq, convId = aiLog.convId;
@@ -730,7 +819,7 @@
         <h4>AI 回答快照</h4><div class="ai-snapshot">${esc(d.answer || "本次未生成 AI 回答")}</div>
         <h4>参考资料（${d.sources.length} 条）</h4>${renderAISources(d.sources)}
         <details class="ai-source"><summary>完整参考文本快照</summary><pre class="ai-snapshot">${esc(d.context || "没有匹配到资料")}</pre></details>`;
-    } catch (err) { if (seq === aiLog.seq) $("#aiDecisionBody").textContent = "加载失败：" + err.message; }
+    } catch (err) { if (seq === aiLog.seq && token) panelStatus($("#aiDecisionBody"), "加载失败 · " + err.message, () => loadAIDecisionDetail(id)); }
   }
   $("#aiDecisionBody").onclick = (e) => {
     const b = e.target.closest("button"); if (!b || b.disabled) return;
@@ -743,7 +832,9 @@
   let qaItems = [], editingQA = null;
   async function loadQA() {
     const sid = $("#qaSite").value;
-    qaItems = await api("/api/admin/qa" + (sid ? `?site_id=${sid}` : ""));
+    const items = await panelData("#qaList", "问答", () => api("/api/admin/qa" + (sid ? `?site_id=${sid}` : "")), loadQA);
+    if (!items) return;
+    qaItems = items;
     const siteName = (id) => (id ? (state.sites.find((s) => s.id === id) || {}).name || "已删除的站点" : "所有站点");
     $("#qaList").innerHTML = qaItems.length ? qaItems.map((q) => `
       <div class="qa" data-id="${q.id}">
@@ -789,7 +880,8 @@
     clearTimeout(kbTimer);
     const sid = $("#kbSite").value, box = $("#kbBox");
     if (!sid) { box.innerHTML = '<div class="empty">请先在「站点」页创建站点</div>'; return; }
-    const r = await api(`/api/admin/kb/${sid}`);
+    const r = await panelData("#kbBox", "网站资料", () => api(`/api/admin/kb/${sid}`), loadKB, () => $("#kbSite").value === sid, true);
+    if (!r) return;
     const st = r.state || {};
     const chars = r.pages.reduce((a, p) => a + p.chars, 0);
     box.innerHTML = `
@@ -823,8 +915,8 @@
   // ---------- QQ 机器人 ----------
   async function loadQQ() {
     const box = $("#qqCard");
-    let s;
-    try { s = await api("/api/admin/qq/status"); } catch (err) { box.textContent = err.message; return; }
+    const s = await panelData("#qqCard", "QQ 状态", () => api("/api/admin/qq/status"), loadQQ);
+    if (!s) return;
     if (!s.enabled) {
       box.innerHTML = `<h3>QQ 机器人</h3><p class="muted">未配置。在 <code>.env</code> 中填写 <code>QQ_APP_ID</code> 和
         <code>QQ_APP_SECRET</code> 后重启服务，客服即可在 QQ 上收发访客消息。</p><button class="btn sm" data-qq="deliveries">查看投递记录</button>`;
@@ -848,6 +940,7 @@
           : "未绑定"}</dd>
         ${s.bound ? `<dt>转发状态</dt><dd>访客消息积压 ${s.pending} 条 · 转人工通知待完成 ${s.handoffs_pending || 0} 条 · 优先级提醒待完成 ${s.priority_pending || 0} 条 · 被动回复窗口${
           s.passive_seconds_left ? `剩余 ${Math.ceil(s.passive_seconds_left / 60)} 分钟` : "已关闭"}</dd>` : ""}
+        ${s.bound ? `<dt>QQ 回复接收</dt><dd>待处理 ${s.inbound_pending || 0} 条${s.inbound_failed ? ` · <span class="delivery-error">${s.inbound_failed} 条处理失败，请核对 QQ 中的回复</span>` : ""}</dd>` : ""}
         ${s.bind_code ? `<dt>绑定码</dt><dd><b class="bind-code">${esc(s.bind_code)}</b>
           <br><small class="muted">用客服的 QQ 给机器人发送「/绑定 ${esc(s.bind_code)}」，${Math.ceil(s.bind_expires_in / 60)} 分钟内有效</small></dd>` : ""}
       </dl>
@@ -900,10 +993,7 @@
     qqLog.page = 1; qqLog.detailId = null; ++qqLog.detailSeq;
     $("#qqDeliveryDrawer").classList.remove("hidden");
     $("#qqDeliveryListView").classList.remove("hidden"); $("#qqDeliveryDetail").classList.add("hidden");
-    $("#qqDeliveryList").textContent = "正在加载投递记录…";
-    $("#qqDeliveryPager").textContent = "";
-    try { await loadQQDeliveries(); }
-    catch (err) { if (!$("#qqDeliveryDrawer").classList.contains("hidden")) $("#qqDeliveryList").textContent = "加载失败：" + err.message; throw err; }
+    await loadQQDeliveries();
   }
   async function loadQQDeliveries() {
     const seq = ++qqLog.seq;
@@ -911,8 +1001,9 @@
     if ($("#qqDeliveryStatus").value) p.set("status", $("#qqDeliveryStatus").value);
     if ($("#qqDeliveryKind").value) p.set("kind", $("#qqDeliveryKind").value);
     if ($("#qqDeliveryConv").value) p.set("conversation_id", $("#qqDeliveryConv").value);
-    const r = await api("/api/admin/qq/deliveries?" + p);
-    if (seq !== qqLog.seq || !token || $("#qqDeliveryDrawer").classList.contains("hidden")) return;
+    const r = await panelData("#qqDeliveryList", "投递记录", () => api("/api/admin/qq/deliveries?" + p),
+      loadQQDeliveries, () => seq === qqLog.seq, true);
+    if (!r) { if (seq === qqLog.seq) $("#qqDeliveryPager").textContent = ""; return; }
     const pages = Math.max(1, Math.ceil(r.total / r.size));
     if (qqLog.page > pages) { qqLog.page = pages; return loadQQDeliveries(); }
     $("#qqDeliveryList").innerHTML = r.items.length ? r.items.map((d) => `<article class="qq-delivery">${deliverySummary(d)}<button class="btn sm" type="button" data-delivery-id="${d.id}">查看分段与补发</button></article>`).join("") : '<p class="empty">暂无符合条件的投递记录。</p>';
@@ -921,8 +1012,14 @@
   async function loadQQDeliveryDetail(id) {
     qqLog.detailId = id;
     const seq = ++qqLog.detailSeq;
-    const r = await api(`/api/admin/qq/deliveries/${id}`);
+    const r = await panelData("#qqDeliveryDetail", "投递详情", () => api(`/api/admin/qq/deliveries/${id}`),
+      () => loadQQDeliveryDetail(id), () => seq === qqLog.detailSeq, true);
     if (seq !== qqLog.detailSeq || !token || $("#qqDeliveryDrawer").classList.contains("hidden")) return;
+    if (!r) {
+      $("#qqDeliveryListView").classList.add("hidden"); $("#qqDeliveryDetail").classList.remove("hidden");
+      $("#qqDeliveryDetail").insertAdjacentHTML("beforeend", '<button class="btn sm" type="button" data-delivery-back>← 返回投递列表</button>');
+      return;
+    }
     const d = r.delivery;
     $("#qqDeliveryListView").classList.add("hidden"); $("#qqDeliveryDetail").classList.remove("hidden");
     $("#qqDeliveryDetail").innerHTML = `<button class="btn sm" type="button" data-delivery-back>← 返回投递列表</button><article class="qq-delivery">${deliverySummary(d)}
@@ -1048,6 +1145,7 @@
     if ($("#cFrom").value) p.set("date_from", $("#cFrom").value);
     if ($("#cTo").value) p.set("date_to", $("#cTo").value);
     chat.loading = true;
+    if (!chat.list.length) panelStatus($("#convList"), "正在加载对话…", null, true);
     renderConvPagination();
     try {
       const result = await api("/api/admin/conversations?" + p);
@@ -1061,12 +1159,11 @@
       if (seq === chat.listSeq) {
         chat.list = []; chat.selected.clear();
         renderConvList();
-        $("#convList").textContent = err.message;
-        $("#convList").classList.add("list-error");
+        panelStatus($("#convList"), "对话加载失败 · " + err.message, loadConvs);
       }
       throw err;
     } finally {
-      if (seq === chat.listSeq) { chat.loading = false; renderConvPagination(); }
+      if (seq === chat.listSeq) { chat.loading = false; $("#convList").setAttribute("aria-busy", "false"); renderConvPagination(); }
     }
   }
 
@@ -1097,8 +1194,8 @@
   let tagItems = [], tagLoadSeq = 0;
   async function loadTags() {
     const seq = ++tagLoadSeq;
-    const items = await api("/api/admin/tags");
-    if (seq !== tagLoadSeq || !token) return;
+    const items = await panelData("#tagCatalog", "标签", () => api("/api/admin/tags"), loadTags, () => seq === tagLoadSeq, true);
+    if (!items) return;
     tagItems = items;
     const filter = $("#cTag"), previous = filter.value;
     filter.innerHTML = '<option value="">全部标签</option>' + items.map((t) =>
@@ -1228,6 +1325,7 @@
     const box = $("#chatMsgs");
     if (!box || chat.msgIds.has(m.id)) return;
     chat.msgIds.add(m.id);
+    $("[data-empty-chat]", box)?.remove();
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
     const isImg = m.msg_type === "image" && /^\/uploads\/[\w.]+$/.test(m.content);
     const body = isImg
@@ -1236,7 +1334,11 @@
     box.insertAdjacentHTML("beforeend", `<div class="msg ${esc(m.sender)}${m.id === chat.focusMessageId ? " search-target" : ""}" data-message-id="${m.id}">${m.sender === "ai" ? '<div class="who">AI 助手</div>' : ""}
       <div class="bub${isImg ? " img" : ""}">${body}${
       m.sender !== "system" ? `<time>${esc(shortTime(m.created_at))}</time>` : ""}</div>${m.sender === "ai" ? `<button class="btn sm ai-evidence-btn" type="button" data-ai-message="${m.id}">参考资料与处理依据</button>` : ""}</div>`);
-    if (isImg) $("img", box.lastElementChild).onload = () => { if (nearBottom) box.scrollTop = box.scrollHeight; };
+    if (isImg) {
+      const image = $("img", box.lastElementChild);
+      image.onload = () => { if (nearBottom) box.scrollTop = box.scrollHeight; };
+      image.onerror = () => { image.parentElement.textContent = "图片无法加载，点击查看原图"; };
+    }
     if (nearBottom || m.sender === "agent") box.scrollTop = box.scrollHeight;
   }
 
@@ -1253,11 +1355,12 @@
 
   function renderHistoryMessages() {
     chat.msgIds = new Set();
-    $("#chatMsgs").innerHTML = "";
+    $("#chatMsgs").innerHTML = chat.messages.length ? "" : '<p class="empty" data-empty-chat>暂无聊天消息</p>';
     chat.messages.forEach(appendMsg);
   }
 
   function receiveChatMessage(m) {
+    if (chat.recovering) { chat.missed.push(m); return; }
     if (chat.historyBusy) chat.historyLive.push(m);
     if (chat.hasNewer) return; // Keep the historical window contiguous until the agent returns to latest.
     if (chat.msgIds.has(m.id)) return;
@@ -1266,7 +1369,7 @@
   }
 
   async function loadHistory(direction) {
-    if (!chat.cur || chat.historyBusy || !chat.messages.length) return;
+    if (!chat.cur || chat.historyBusy || chat.recovering || (direction !== "latest" && !chat.messages.length)) return;
     const id = chat.cur.id, seq = chat.openSeq;
     const p = new URLSearchParams({ limit: 100 });
     if (direction === "older") p.set("before_id", chat.messages[0].id);
@@ -1276,7 +1379,7 @@
     renderHistoryControls();
     try {
       const r = await api(`/api/admin/conversations/${id}/messages?${p}`);
-      if (!chat.cur || chat.cur.id !== id || chat.openSeq !== seq) return;
+      if (!chat.cur || chat.cur.id !== id || chat.openSeq !== seq || chat.recovering) return;
       const box = $("#chatMsgs"), top = box.scrollTop, height = box.scrollHeight;
       if (direction === "latest") {
         chat.messages = r.items;
@@ -1317,10 +1420,25 @@
 
   async function openConv(id, messageId = null) {
     const seq = ++chat.openSeq;
-    const r = await api(`/api/admin/conversations/${id}${messageId ? "?message_id=" + messageId : ""}`);
+    const pane = $("#chatPane");
+    const status = $("#conversationLoad") || document.createElement("div");
+    status.id = "conversationLoad";
+    pane.prepend(status);
+    $(".chat-layout").classList.add("has-conv");
+    const back = document.createElement("button");
+    back.type = "button"; back.className = "btn sm back-btn"; back.textContent = "← 返回";
+    back.onclick = closePane;
+    const result = panelData("#conversationLoad", "会话", () => api(`/api/admin/conversations/${id}${messageId ? "?message_id=" + messageId : ""}`),
+      () => openConv(id, messageId), () => seq === chat.openSeq);
+    status.prepend(back);
+    const r = await result;
     if (seq !== chat.openSeq) return;
+    if (!r) { status.prepend(back); return; }
     const c = r.conversation, v = r.visitor;
     chat.cur = c;
+    chat.syncing = null;
+    chat.missed = [];
+    chat.recovering = chat.wasLive && !chat.live;
     chat.notes = r.notes || [];
     chat.messages = r.messages;
     chat.focusMessageId = messageId;
@@ -1348,6 +1466,8 @@
           </form>
         </div>
       </details>
+      <div id="chatLinkState" class="chat-link-state hidden"><span role="status"></span><button type="button" class="btn sm" data-act="reconnect">立即重连</button></div>
+      <div id="chatSync" class="hidden"></div>
       <div id="historyTools" class="history-tools hidden">
         <button type="button" id="loadOlder" class="btn sm">更早消息</button>
         <button type="button" id="loadNewer" class="btn sm">后续消息</button>
@@ -1363,6 +1483,7 @@
         <button class="btn primary" id="replyBtn">发送</button>
       </div>`;
     renderChatHead();
+    setLive(chat.linkState || "connecting");
     refreshRelatedCount().catch((err) => toast(err.message));
     renderConversationTags();
     renderNotes(chat.notes);
@@ -1418,12 +1539,14 @@
     $("#replyInput").addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); sendReply(); }
     });
-    if (!messageId) $("#replyInput").focus();
+    if (!messageId && matchMedia("(min-width: 761px)").matches) $("#replyInput").focus();
   }
 
   function closePane() {
     ++chat.openSeq;
+    chat.syncing = null;
     chat.cur = null;
+    chat.missed = [];
     $("#chatPane").innerHTML = EMPTY_PANE;
     $(".chat-layout").classList.remove("has-conv");
     renderConvList();
@@ -1454,9 +1577,7 @@
     try {
       const fd = new FormData();
       fd.append("file", file);
-      const res = await fetch("/api/admin/upload", { method: "POST", headers: { Authorization: "Bearer " + token }, body: fd });
-      const up = await res.json();
-      if (!res.ok) throw new Error(up.detail || "上传失败");
+      const up = await api("/api/admin/upload", {method:"POST", body:fd, timeout:30000});
       const r = await api(`/api/admin/conversations/${convId}/messages`, { method: "POST", body: { content: up.url, msg_type: "image" } });
       if (chat.cur && chat.cur.id === convId && seq === chat.openSeq) {
         if (chat.hasNewer) await loadHistory("latest");
@@ -1488,6 +1609,7 @@
       if (act === "summary") return await openSummary(id);
       if (act === "ai-evidence") return await openAIDecisions(id);
       if (act === "back") return closePane();
+      if (act === "reconnect") return liveConnect();
       if (act === "close" || act === "reopen") {
         await api(`/api/admin/conversations/${id}/status`, { method: "POST", body: { status: act === "close" ? "closed" : "waiting" } });
       }
@@ -1562,30 +1684,103 @@
   let statsTimer;
   const refreshStats = () => { clearTimeout(statsTimer); statsTimer = setTimeout(() => loadStats().catch(() => {}), 500); };
 
-  function setLive(ok) {
-    const s = $("#liveState");
-    s.textContent = ok ? "● 实时连接正常" : "实时连接已断开，正在重连…";
-    s.classList.toggle("ok", ok);
+  async function syncOpenChat() {
+    if (!chat.cur || !$("#chatSync") || !chat.live || chat.syncing) return;
+    const id = chat.cur.id, seq = chat.openSeq, box = $("#chatSync");
+    const sync = {};
+    chat.syncing = sync;
+    chat.recovering = true;
+    box.classList.remove("hidden");
+    panelStatus(box, "正在同步断线期间的消息…");
+    try {
+      const anchor = chat.messages.at(-1)?.id;
+      const params = chat.hasNewer && anchor ? "after_id=" + anchor + "&limit=1" : "limit=500";
+      const result = await api(`/api/admin/conversations/${id}/messages?${params}`);
+      if (seq !== chat.openSeq || !chat.live || chat.syncing !== sync) return;
+      if (chat.hasNewer) chat.hasNewer = result.has_newer || result.items.length > 0;
+      else {
+        const messages = result.items;
+        const first = messages[0]?.id;
+        const overlap = messages.some((m) => chat.msgIds.has(m.id));
+        const older = overlap ? chat.messages.filter((m) => m.id < first) : [];
+        const byId = new Map([...older, ...messages, ...chat.missed].map((m) => [m.id, m]));
+        chat.messages = [...byId.values()].sort((a, b) => a.id - b.id);
+        if (!older.length) chat.hasOlder = result.has_older;
+        const list = $("#chatMsgs");
+        const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+        const top = list.scrollTop;
+        renderHistoryMessages();
+        list.scrollTop = nearBottom ? list.scrollHeight : top;
+      }
+      chat.missed = [];
+      chat.recovering = false;
+      markCurRead();
+      box.classList.add("hidden");
+      renderHistoryControls();
+    } catch (err) {
+      if (seq === chat.openSeq && chat.live && chat.syncing === sync) panelStatus(box, "消息同步失败 · " + err.message, syncOpenChat);
+    } finally {
+      if (chat.syncing === sync) chat.syncing = null;
+    }
+  }
+
+  function setLive(status) {
+    const live = status === "ready";
+    chat.live = live;
+    chat.linkState = status;
+    const text = {
+      ready: "● 实时连接正常",
+      connecting: "正在连接实时消息…",
+      reconnecting: "实时连接已断开，正在重连…",
+      offline: "网络已断开，联网后将自动重连",
+    }[status];
+    $("#liveState").textContent = text;
+    $("#liveState").classList.toggle("ok", live);
+    const paneState = $("#chatLinkState");
+    if (paneState) {
+      paneState.classList.toggle("hidden", live);
+      $("span", paneState).textContent = text;
+      $("button", paneState).classList.toggle("hidden", status === "connecting");
+    }
+    $("#retryLive").classList.toggle("hidden", live || status === "connecting");
   }
 
   function liveConnect() {
-    if (!token) return;
+    if (!token || chat.ws?.readyState === WebSocket.CONNECTING || chat.ws?.readyState === WebSocket.OPEN) return;
     clearTimeout(chat.timer);
+    if (!navigator.onLine) { setLive("offline"); return; }
+    setLive(chat.wasLive ? "reconnecting" : "connecting");
     const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/api/admin/ws");
     chat.ws = ws;
+    let deadline = setTimeout(() => ws.close(), 12000);
     ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token }));
     ws.onmessage = (ev) => {
+      if (chat.ws !== ws) return;
       let d;
       try { d = JSON.parse(ev.data); } catch (_) { return; }
-      if (d.type === "ready") {
-        chat.retry = 0;
-        setLive(true);
+      if (d.type === "pong") {
+        clearTimeout(deadline);
+      } else if (d.type === "ready") {
+        clearTimeout(deadline);
         clearInterval(chat.ping);
-        chat.ping = setInterval(() => ws.readyState === 1 && ws.send('{"type":"ping"}'), 25000);
-        refreshTagViews().catch((e) => toast(e.message));
-        refreshRelatedCount().catch((e) => toast(e.message));
+        chat.ping = setInterval(() => {
+          if (ws.readyState !== WebSocket.OPEN) return;
+          ws.send('{"type":"ping"}');
+          deadline = setTimeout(() => ws.close(), 12000);
+        }, 25000);
+        const reconnected = chat.wasLive || chat.retry > 0;
+        chat.wasLive = true;
+        chat.retry = 0;
+        setLive("ready");
+        if (reconnected) {
+          syncOpenChat();
+          refreshTagViews().catch((e) => toast(e.message));
+          refreshRelatedCount().catch(() => {});
+          if (document.body.dataset.view === "messages") loadMessages(true);
+          refreshStats();
+        }
       } else if (d.type === "inbox_changed") {
-        if (document.body.dataset.view === "messages") loadMessages().catch((e) => toast(e.message));
+        if (document.body.dataset.view === "messages") loadMessages(true);
         if (chat.cur && (d.conversation_ids || []).includes(chat.cur.id)) refreshRelatedCount().catch((e) => toast(e.message));
         if (!$("#relatedDrawer").classList.contains("hidden") && (d.conversation_ids || []).includes(related.convId)) {
           showRelated(related.convId, false).catch((e) => toast(e.message));
@@ -1614,7 +1809,7 @@
         const isCur = chat.cur && chat.cur.id === d.conversation.id;
         if (isCur) receiveChatMessage(d.message);
         upsertConv(d.conversation);
-        if (isCur && d.message.sender === "visitor") markCurRead();
+        if (isCur && d.message.sender === "visitor" && !chat.recovering) markCurRead();
         if (d.message.sender === "visitor" && (!isCur || document.hidden)) notify(d.conversation, d.message);
         refreshStats();
       } else if (d.type === "conv") {
@@ -1627,7 +1822,7 @@
         if (related.convId === d.id) { ++related.seq; $("#relatedDrawer").classList.add("hidden"); $("#backToRelated")?.remove(); }
         const source = $("#viewSourceConv");
         if (source?.dataset.convId === String(d.id)) { source.disabled = true; source.textContent = "来源会话已删除，留言仍保留"; }
-        if (document.body.dataset.view === "messages") loadMessages().catch((e) => toast(e.message));
+        if (document.body.dataset.view === "messages") loadMessages(true);
         chat.list = chat.list.filter((c) => c.id !== d.id);
         if (chat.cur && chat.cur.id === d.id) closePane(); else renderConvList();
         scheduleConvRefresh();
@@ -1635,29 +1830,48 @@
       }
     };
     ws.onclose = (ev) => {
+      clearTimeout(deadline);
+      if (chat.ws !== ws) return;
       clearInterval(chat.ping);
-      if (chat.ws !== ws) return;  // 已被新连接取代
-      setLive(false);
-      if (ev.code === 4401) return logout();
+      chat.ws = null;
+      if (ev.code === 4401) { logout(); $("#loginErr").textContent = "登录已过期，请重新登录"; return; }
       if (!token) return;
-      chat.timer = setTimeout(() => {
-        liveConnect();
-        loadConvs().catch(() => {});  // 断线期间可能漏了事件，重新拉一次列表
-      }, Math.min(30000, 1000 * 2 ** chat.retry++));
+      chat.recovering = Boolean(chat.cur);
+      chat.syncing = null;
+      if (!navigator.onLine) { setLive("offline"); return; }
+      setLive("reconnecting");
+      chat.timer = setTimeout(liveConnect, Math.min(30000, 1000 * 2 ** chat.retry++));
     };
   }
+  $("#retryLive").onclick = liveConnect;
+  window.addEventListener("online", liveConnect);
+  if (window.visualViewport) {
+    const sizeForKeyboard = () => {
+      const viewport = window.visualViewport;
+      const inset = document.documentElement.clientHeight - viewport.height;
+      document.body.classList.toggle("keyboard-open", viewport.scale < 1.1 && inset > 100);
+      document.body.style.setProperty("--visible-height", viewport.height + "px");
+    };
+    window.visualViewport.addEventListener("resize", sizeForKeyboard);
+    sizeForKeyboard();
+  }
+  window.addEventListener("offline", () => {
+    if (!token) return;
+    setLive("offline");
+    chat.ws?.close();
+  });
 
   // ---------- 启动 ----------
-  async function boot() {
+  function boot() {
     if (!token) return showLogin();
-    try {
-      await Promise.all([loadStats(), loadSites(), loadTags()]);
-      $("#login").classList.add("hidden");
-      $("#app").classList.remove("hidden");
-      route();
-      await Promise.all([loadMessages(), loadConvs()]);
-      liveConnect();
-    } catch (err) { if (token) toast(err.message); }
+    $("#login").classList.add("hidden");
+    $("#app").classList.remove("hidden");
+    route();
+    if (document.body.dataset.view !== "sites") loadSites();
+    loadStats();
+    loadTags().catch((err) => toast(err.message));
+    loadConvs().catch(() => {});
+    liveConnect();
   }
   boot();
 })();

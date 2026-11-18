@@ -58,6 +58,7 @@ class QQDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.qq.client = self.fake
         self.addCleanup(setattr,self.qq,'client',self.old_client)
         with self.db.get_db() as db:
+            db.execute('DELETE FROM qq_inbound')
             db.execute('DELETE FROM settings')
             db.execute('DELETE FROM qa')
             db.execute('DELETE FROM sites')
@@ -248,52 +249,172 @@ class QQDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.job(other)['status'], 'uncertain')
         self.assertEqual(self.fake.send_c2c.await_count, count)
 
+    def enqueue_reply(self, msg_id, content, **fields):
+        from app import qq_inbound
+        data = {"id": msg_id, "author":{"user_openid":"test-agent"}, "content":content, **fields}
+        qq_inbound.accept(self.qq.QQ_APP_ID, msg_id, data)
+        return data
+
+    def inbound_rows(self):
+        with self.db.get_db() as db:
+            return [dict(r) for r in db.execute("SELECT * FROM qq_inbound ORDER BY id")]
+
     async def test_concurrent_binding_consumes_code_once_and_cancels_old_jobs(self):
         from unittest.mock import AsyncMock
+        from app import qq_inbound
         import time
-        cid, mid = self.conversation('pending for original agent')
+        cid, mid = self.conversation("pending for original agent")
         self.fake.fail_on = {1}
         await self.delivery.flush_conversation(cid)
-        jid = self.job(cid)['id']
-        self.qq.update_agent(bind_code='123456', bind_expires=time.time()+60, current_conv_id=cid)
-        await self.delivery.queue_lock.acquire()
-        with patch.object(self.qq, 'deliver', new_callable=AsyncMock) as ack, \
-                patch.object(self.qq, 'reply_to', new_callable=AsyncMock) as rejected, \
-                patch.object(self.qq, 'flush_backlog', new_callable=AsyncMock):
-            tasks = [asyncio.create_task(self.qq.handle_c2c({'author':{'user_openid':recipient},
-                       'content':'/绑定 123456', 'id':'incoming-'+recipient})) for recipient in ('new-agent','other-agent')]
-            await asyncio.sleep(0)
-            self.delivery.queue_lock.release()
-            await asyncio.gather(*tasks)
+        jid = self.job(cid)["id"]
+        self.qq.update_agent(bind_code="123456", bind_expires=time.time()+60, current_conv_id=cid)
+        version = self.qq.agent()["binding_version"]
+        self.enqueue_reply("new-binding", "/绑定 123456", author={"user_openid":"new-agent"})
+        self.enqueue_reply("competing-binding", "/绑定 123456", author={"user_openid":"other-agent"})
+        self.enqueue_reply("reply-in-old-binding", f"#{cid} old reply")
+        with patch.object(self.qq, "deliver", new_callable=AsyncMock) as ack:
+            self.assertTrue(await qq_inbound.process_one())
+            self.assertFalse(await qq_inbound.process_one())
             self.assertEqual(ack.await_count, 1)
-            self.assertEqual(rejected.await_count, 1)
-        self.assertEqual(self.qq.agent()['openid'], 'new-agent')
-        self.assertIsNone(self.qq.agent()['current_conv_id'])
-        self.assertEqual(self.delivery.delivery_detail(jid)['delivery']['status'], 'cancelled')
+        self.assertEqual([r["status"] for r in self.inbound_rows()], ["done","cancelled","cancelled"])
+        self.assertEqual(self.qq.agent()["openid"], "new-agent")
+        self.assertEqual(self.qq.agent()["bind_code"], "")
+        self.assertEqual(self.qq.agent()["binding_version"], version + 1)
+        self.assertIsNone(self.qq.agent()["current_conv_id"])
+        self.assertEqual(self.delivery.delivery_detail(jid)["delivery"]["status"], "cancelled")
         with self.db.get_db() as db:
-            self.assertEqual(db.execute('SELECT qq_state FROM chat_messages WHERE id=?', (mid,)).fetchone()[0], '')
+            self.assertEqual(db.execute("SELECT qq_state FROM chat_messages WHERE id=?", (mid,)).fetchone()[0], "")
 
     async def test_reply_uses_guarded_target_after_backlog(self):
         from unittest.mock import AsyncMock
-        cid,_ = self.conversation('original target')
-        other,_ = self.conversation('new pending header')
-        self.qq.update_agent(current_conv_id=cid,current_set_at=0)
-        async def uncertain_backlog():
-            self.qq.update_agent(current_conv_id=None,current_set_at=0)
-        with patch.object(self.qq, 'flush_backlog', side_effect=uncertain_backlog), \
-                patch.object(self.qq, 'deliver', new_callable=AsyncMock) as ack, \
-                patch('app.chat.agent_reply', new_callable=AsyncMock) as reply:
-            await self.qq.handle_c2c({'author':{'user_openid':'test-agent'},'content':'must not reach old visitor','id':'incoming'})
-            reply.assert_not_awaited()
-            self.assertIn('当前没有可回复的会话',ack.call_args.args[0])
-        async def new_backlog():
-            self.qq.update_agent(current_conv_id=other,current_set_at=__import__('time').time())
-        with patch.object(self.qq, 'flush_backlog', side_effect=new_backlog), \
-                patch.object(self.qq, 'deliver', new_callable=AsyncMock) as ack, \
-                patch('app.chat.agent_reply', new_callable=AsyncMock) as reply:
-            await self.qq.handle_c2c({'author':{'user_openid':'test-agent'},'content':'must respect new guard','id':'incoming-2'})
-            reply.assert_not_awaited()
-            self.assertIn('为避免回错人',ack.call_args.args[0])
+        from app import chat, qq_inbound
+        import time
+        cid, _ = self.conversation("original target")
+        other, _ = self.conversation("new pending header")
+        self.qq.update_agent(current_conv_id=cid, current_set_at=0)
+        self.enqueue_reply("incoming-1", "must not reach old visitor")
+        self.qq.update_agent(current_conv_id=None, current_set_at=0)
+        with patch.object(self.qq, "deliver", new_callable=AsyncMock) as ack:
+            await qq_inbound.process_one()
+            self.assertIn("当前没有可回复的会话", ack.call_args.args[0])
+            self.qq.update_agent(current_conv_id=cid, current_set_at=0)
+            self.enqueue_reply("incoming-2", "must respect new guard")
+            self.qq.update_agent(current_conv_id=other, current_set_at=time.time())
+            await qq_inbound.process_one()
+            self.assertIn("当前会话刚切换", ack.call_args.args[0])
+        self.assertEqual(len(chat.history(cid)), 1)
+        self.assertEqual(len(chat.history(other)), 1)
+
+    async def test_inbound_quotes_fail_closed_and_explicit_target_is_supported(self):
+        from unittest.mock import AsyncMock
+        from app import chat, qq_inbound
+        target, _ = self.conversation("intended target")
+        current, _ = self.conversation("current target")
+        self.qq.update_agent(current_conv_id=current,current_set_at=0)
+        with self.db.get_db() as db:
+            db.execute("INSERT INTO qq_forwards (qq_msg_id,conversation_id) VALUES ('known',?)", (target,))
+        self.enqueue_reply("unknown-reference", "no target", message_reference={"message_id":"unknown"})
+        self.enqueue_reply("conflicting-reference", f"#{current} conflicting target", message_reference={"message_id":"known"})
+        self.enqueue_reply("explicit-after-unmapped", f"#{target} explicit text", message_reference={"message_id":"unknown"})
+        self.enqueue_reply("known-reference", "quoted text", message_reference={"message_id":"known"})
+        wide_id = str(target).translate(str.maketrans("0123456789", "０１２３４５６７８９"))
+        self.enqueue_reply("wide-id", f"#{wide_id} wide number")
+        with patch.object(self.qq, "deliver", new_callable=AsyncMock) as ack:
+            for _ in range(5):
+                self.assertTrue(await qq_inbound.process_one())
+        self.assertEqual(len(chat.history(current)), 1)
+        self.assertEqual([m["content"] for m in chat.history(target) if m["sender"]=="agent"], ["explicit text","quoted text","wide number"])
+        self.assertIn("找不到引用消息", ack.await_args_list[0].args[0])
+        self.assertIn("回复目标不一致", ack.await_args_list[1].args[0])
+
+    async def test_qq_callback_commits_before_ack_and_duplicate_after_restart_is_ignored(self):
+        import json
+        import time
+        from unittest.mock import AsyncMock
+        from starlette.requests import Request
+        from app import chat, qq_inbound
+        cid, _ = self.conversation("test visitor")
+        data = {"id":"platform-message", "author":{"user_openid":"test-agent"}, "content":f"#{cid} preserved reply"}
+        async def callback(envelope_id):
+            body = json.dumps({"op":0,"id":envelope_id,"t":"C2C_MESSAGE_CREATE","d":data}).encode()
+            timestamp = str(int(time.time()))
+            signature = self.qq._key.sign(timestamp.encode()+body).hex()
+            receive = AsyncMock(return_value={"type":"http.request","body":body})
+            return await self.qq.callback(Request({"type":"http","headers":[
+                (b"x-signature-timestamp",timestamp.encode()),
+                (b"x-signature-ed25519",signature.encode())]},receive))
+        self.assertEqual(await callback("envelope-1"),{"op":12})
+        self.assertEqual(self.inbound_rows()[0]["status"],"pending")
+        self.assertEqual(len(chat.history(cid)),1)
+        self.db.init_db()  # No in-memory state from accepting the callback is needed.
+        with patch.object(chat, "broadcast_message", new_callable=AsyncMock, side_effect=RuntimeError("broadcast interrupted")):
+            self.assertTrue(await qq_inbound.process_one())
+        self.assertEqual(self.inbound_rows()[0]["status"],"done")
+        self.assertIsNone(self.inbound_rows()[0]["payload"])
+        self.assertEqual(await callback("envelope-2"),{"op":12})
+        self.assertFalse(await qq_inbound.process_one())
+        self.assertEqual([m["content"] for m in chat.history(cid) if m["sender"]=="agent"],["preserved reply"])
+        self.assertEqual(len(self.inbound_rows()),1)
+
+    async def test_inbound_batch_rolls_back_and_keeps_target_on_retry(self):
+        from app import chat, qq_inbound
+        cid, _ = self.conversation("image target")
+        other, _ = self.conversation("unrelated")
+        with self.db.get_db() as db:
+            db.execute("INSERT INTO qq_forwards (qq_msg_id,conversation_id) VALUES ('old-map',?)",(cid,))
+        self.enqueue_reply("image-text", "image caption", message_reference={"message_id":"old-map"},
+                           attachments=[{"content_type":"image/png","url":"https://example.invalid/image"}])
+        real_add = chat.add_message
+        def fail_after_image(*args, **kwargs):
+            if kwargs["msg_type"]=="text":
+                raise RuntimeError("interrupted after writing the image in this transaction")
+            return real_add(*args,**kwargs)
+        with patch.object(self.qq, "_download", return_value=b"fake image"), \
+                patch("app.media.save_image", return_value="/uploads/fixture.png"), \
+                patch.object(chat,"add_message",side_effect=fail_after_image):
+            await qq_inbound.process_one()
+        self.assertEqual(len(chat.history(cid)),1)
+        self.assertEqual(self.inbound_rows()[0]["status"],"pending")
+        self.assertEqual(self.inbound_rows()[0]["target_conv_id"],cid)
+        with self.db.get_db() as db:
+            db.execute("UPDATE qq_inbound SET next_attempt_at=0")
+            db.execute("UPDATE qq_forwards SET conversation_id=? WHERE qq_msg_id='old-map'",(other,))
+        self.db.init_db()
+        with patch.object(self.qq, "_download", return_value=b"fake image"), \
+                patch("app.media.save_image", return_value="/uploads/fixture.png"):
+            await qq_inbound.process_one()
+        self.assertEqual([m["msg_type"] for m in chat.history(cid) if m["sender"]=="agent"],["image","text"])
+        self.assertEqual(len(chat.history(other)),1)
+
+    async def test_visitor_message_is_discoverable_before_any_broadcast_or_hook(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from fastapi import WebSocketDisconnect
+        from app import chat
+        class FixtureSocket(SimpleNamespace):
+            __hash__ = object.__hash__
+
+        websocket = FixtureSocket(headers={},client=SimpleNamespace(host="isolated-fixture"),
+                                  accept=AsyncMock(),close=AsyncMock(),send_json=AsyncMock())
+        with self.db.get_db() as db:
+            db.execute("UPDATE sites SET require_contact=0 WHERE id=?", (self.site,))
+        websocket.receive_json = AsyncMock(side_effect=[
+            {"type":"hello","site_key":"qq-test-key"},
+            {"type":"msg","client_id":"isolated","content":"message survives restart"},
+            WebSocketDisconnect(),
+        ])
+        async def after_commit(conv_id, message, client_id):
+            with self.db.get_db() as db:
+                self.assertEqual(db.execute("SELECT qq_state FROM chat_messages WHERE id=?",(message["id"],)).fetchone()[0],"pending")
+            await self.delivery.flush_backlog()
+            self.assertEqual(self.job(conv_id)["status"],"sent")
+            raise WebSocketDisconnect()
+        with patch.object(chat,"broadcast_message",side_effect=after_commit) as broadcast:
+            await chat.visitor_ws(websocket)
+            broadcast.assert_awaited_once()
+        self.assertEqual(sum("message survives restart" in c["body"].get("content","") for c in self.fake.calls),1)
+        await self.delivery.flush_backlog()
+        self.assertEqual(len(self.fake.calls),1)
 
     async def test_handoff_snapshot_dedup_archive_merge_and_quote(self):
         from unittest.mock import AsyncMock
@@ -325,11 +446,12 @@ class QQDeliveryTests(unittest.IsolatedAsyncioTestCase):
             db.execute("INSERT INTO chat_messages (conversation_id,sender,content) VALUES (?,'visitor','补充第二项需求')",(cid,))
         with patch.object(auto,'ai_ready',return_value=False):
             await auto.handle_unattended(cid,'timeout')
-        latest=self.job(cid)
-        self.assertNotEqual(job['id'],latest['id'])
-        self.assertEqual(job['inbox_message_id'],latest['inbox_message_id'])
+        self.assertEqual(self.job(cid)["id"], job["id"])  # Follow-ups don't send another handoff.
         with self.db.get_db() as db:
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM messages WHERE conversation_id=?',(cid,)).fetchone()[0],1)
+            archived = db.execute("SELECT id,content FROM messages WHERE conversation_id=?", (cid,)).fetchall()
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0]["id"], job["inbox_message_id"])
+        self.assertIn("补充第二项需求", archived[0]["content"])
 
     async def test_handoff_failures_retry_without_pending_visitor_and_binding_cancel(self):
         from app import auto
@@ -515,6 +637,75 @@ class QQDeliveryTests(unittest.IsolatedAsyncioTestCase):
         other,_=self.conversation('availability recovered during merge')
         with patch.object(chat,'site_online',return_value=True): await auto.handle_unattended(other,'offline')
         self.assertEqual(self.delivery.list_deliveries(status=None,conversation_id=other,page=1,size=20)['total'],0)
+
+    async def test_ai_first_timeout_transfers_and_stops_ai_until_new_round(self):
+        from app import auto, chat
+        from unittest.mock import AsyncMock
+
+        self.enable_fake_ai()
+        cid, mid = self.conversation("等一个不会及时返回的模型")
+        with self.db.get_db() as db:
+            db.execute("UPDATE chat_messages SET qq_state='' WHERE id=?", (mid,))
+        async def slow(*args):
+            await asyncio.Event().wait()
+
+        with patch.object(auto, "LIVE_REPLY_SECONDS", .04), patch.object(auto, "ai_answer", side_effect=slow) as model:
+            await asyncio.wait_for(auto.handle_unattended(cid, "ai_first"), 1)
+            chat.add_message(cid, "visitor", "补充给人工的信息")
+            await auto.handle_unattended(cid, "ai_first")
+            model.assert_awaited_once()
+        with self.db.get_db() as db:
+            results = [row["reason_code"] for row in db.execute(
+                "SELECT reason_code FROM ai_decisions WHERE conversation_id=? ORDER BY id", (cid,))]
+        self.assertEqual(results, ["reply_timeout", "human_pending"])
+        self.assertEqual(self.delivery.list_deliveries(
+            status=None, conversation_id=cid, kind="handoff", page=1, size=10)["total"], 1)
+        self.assertTrue(chat.conv_summary(cid)["ai_waiting_for_agent"])
+        self.assertIn(auto.HANDOFF_TEXT, [message["content"] for message in chat.history(cid)])
+        await chat.set_conversation_status(cid, "closed")
+        chat.add_message(cid, "visitor", "重新开始咨询")
+        with patch.object(auto, "ai_answer", new_callable=AsyncMock, return_value=("新一轮 AI 回复", False)) as model:
+            await auto.handle_unattended(cid, "ai_first")
+            await chat.agent_reply(cid, "我来处理")
+            chat.add_message(cid, "visitor", "给已接管客服的新消息")
+            await auto.handle_unattended(cid, "ai_first")
+            await auto.handle_unattended(cid, "timeout_archive")
+            model.assert_awaited_once()
+        self.assertFalse(chat.conv_summary(cid)["ai_waiting_for_agent"])
+        self.assertEqual([x["content"] for x in chat.history(cid) if x["sender"]=="ai"], ["新一轮 AI 回复"])
+
+    async def test_ai_first_handoff_does_not_wait_for_slow_summary(self):
+        from app import auto, chat, summaries
+        from unittest.mock import AsyncMock
+
+        self.enable_fake_ai()
+        cid, mid = self.conversation("请转人工")
+        with self.db.get_db() as db:
+            db.execute("UPDATE chat_messages SET qq_state='' WHERE id=?", (mid,))
+        async def slow(*args):
+            await asyncio.Event().wait()
+
+        with patch.object(auto, "LIVE_SUMMARY_SECONDS", .04), patch.object(summaries, "prepare", side_effect=slow), \
+                patch.object(auto, "ai_answer", new_callable=AsyncMock, return_value=("", True)):
+            await asyncio.wait_for(auto.handle_unattended(cid, "ai_first"), 1)
+        self.assertTrue(chat.conv_summary(cid)["ai_waiting_for_agent"])
+        self.assertEqual(self.job(cid)["kind"], "handoff")
+        self.assertEqual(self.job(cid)["status"], "pending")
+        self.assertIn(auto.HANDOFF_TEXT, [m["content"] for m in chat.history(cid)])
+
+    async def test_old_unanswered_batch_is_archived_without_a_late_ai_reply(self):
+        from app import auto, chat
+        from unittest.mock import AsyncMock
+
+        self.enable_fake_ai()
+        cid, mid = self.conversation("旧的来访消息")
+        with patch.object(auto, "ai_answer", new_callable=AsyncMock) as model:
+            await auto.handle_unattended(cid, "timeout_archive")
+            model.assert_not_awaited()
+        self.assertTrue(chat.conv_summary(cid)["ai_waiting_for_agent"])
+        with self.db.get_db() as db:
+            self.assertEqual(db.execute("SELECT reason_code FROM ai_decisions WHERE conversation_id=?", (cid,)).fetchone()[0],
+                             "first_response_expired")
 
     def enable_fake_ai(self):
         self.db.set_settings({'ai_enabled':'1','ai_base_url':'http://fake-provider.invalid/v1',

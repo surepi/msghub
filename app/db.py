@@ -76,6 +76,23 @@ CREATE INDEX IF NOT EXISTS idx_chat_conv_created ON chat_messages(conversation_i
 
 -- ---------- 二期 ②：QQ 机器人 ----------
 
+CREATE TABLE IF NOT EXISTS qq_inbound (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    app_id TEXT NOT NULL,
+    payload TEXT,
+    received_at REAL NOT NULL,
+    binding_version INTEGER NOT NULL,
+    default_conv_id INTEGER,
+    default_set_at REAL NOT NULL,
+    target_conv_id INTEGER,
+    implicit INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_qq_inbound_due ON qq_inbound(status, next_attempt_at, id);
+
 -- 客服（只有 1 位），固定 id = 1
 CREATE TABLE IF NOT EXISTS qq_agent (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
@@ -288,6 +305,7 @@ CREATE INDEX IF NOT EXISTS idx_conversation_tags_tag ON conversation_tags(tag_id
 
 # 老库迁移：表 → [(列名, 定义)]
 MIGRATIONS = {
+    "qq_agent": [("binding_version", "INTEGER NOT NULL DEFAULT 0")],
     "qq_deliveries": [
         ("triage_id", "INTEGER REFERENCES conversation_triage(id) ON DELETE SET NULL"),
         ("summary_id", "INTEGER REFERENCES conversation_summaries(id) ON DELETE SET NULL"),
@@ -310,7 +328,7 @@ MIGRATIONS = {
         ("ai_enabled", "INTEGER NOT NULL DEFAULT 1"),                   # 该站点是否使用 AI 应答（需全局开启）
         ("crawl_urls", "TEXT NOT NULL DEFAULT ''"),                     # 抓取起始地址，每行一个
     ],
-    "conversations": [("ai_priority_dismissed_upto", "INTEGER NOT NULL DEFAULT 0"), ("auto_handled_upto", "INTEGER NOT NULL DEFAULT 0")],  # 已由 AI / 转留言处理到的访客消息 ID
+    "conversations": [("ai_waiting_for_agent", "INTEGER NOT NULL DEFAULT 0"), ("ai_priority_dismissed_upto", "INTEGER NOT NULL DEFAULT 0"), ("auto_handled_upto", "INTEGER NOT NULL DEFAULT 0")],  # 已由 AI / 转留言处理到的访客消息 ID
 }
 
 STATUSES = ("new", "read", "handled", "spam")
