@@ -143,6 +143,33 @@ class CustomerToolsTests(unittest.TestCase):
             self.assertEqual(response.headers["Cache-Control"], "no-store")
             self.assertEqual(json.load(response), {"ok": True})
 
+    def test_export_keeps_filters_and_order_across_batches(self):
+        site_id = self.sites[0]["id"]
+        excluded_site = self.sites[1]["id"]
+        selected = [
+            self.seed_inbox_message(site_id, content=f"批次回归 {i}", status="handled")
+            for i in range(205)
+        ]
+        self.seed_inbox_message(excluded_site, content="批次回归 其他站点", status="handled")
+        self.seed_inbox_message(site_id, content="批次回归 未处理")
+        self.seed_inbox_message(site_id, content="关键词不匹配", status="handled")
+
+        headers = {"Authorization": "Bearer " + self.token}
+        path = self.base + "/api/admin/messages/export.csv?"
+        params = {"site_id": site_id, "status": "handled", "q": "批次回归"}
+        with urllib.request.urlopen(urllib.request.Request(path + urlencode(params), headers=headers), timeout=5) as response:
+            self.assertEqual(response.headers["Content-Disposition"], "attachment; filename=messages.csv")
+            body = response.read()
+            self.assertTrue(body.startswith(b"\xef\xbb\xbf"))
+        exported = csv.DictReader(io.StringIO(body.decode("utf-8-sig"), newline=""))
+        self.assertEqual([int(row["ID"]) for row in exported], list(reversed(selected)))
+
+        params["q"] = "没有匹配的留言"
+        with urllib.request.urlopen(urllib.request.Request(path + urlencode(params), headers=headers), timeout=5) as response:
+            empty = csv.DictReader(io.StringIO(response.read().decode("utf-8-sig"), newline=""))
+        self.assertEqual(list(empty), [])
+        self.assertEqual(empty.fieldnames, exported.fieldnames)
+
     def test_tag_catalog_validation_and_restart(self):
         catalog = self.request("GET", "/api/admin/tags")[1]
         self.assertTrue({"待报价", "售后", "投诉", "重点客户", "已转化"}.issubset(

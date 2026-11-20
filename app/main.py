@@ -362,7 +362,7 @@ def delete_site(site_id: int):
 
 # ---- 留言 ----
 
-def _msg_filter(site_id: int | None, status: str | None, q: str | None):
+def _msg_filter(site_id: int | None, status: str | None, q: str | None, *, before_id: int | None = None):
     where, args = [], []
     if site_id:
         where.append("m.site_id = ?"); args.append(site_id)
@@ -371,6 +371,9 @@ def _msg_filter(site_id: int | None, status: str | None, q: str | None):
     if q:
         where.append("(m.content LIKE ? OR m.name LIKE ? OR m.contact LIKE ?)")
         args += [f"%{q}%"] * 3
+    if before_id is not None:
+        where.append("m.id < ?")
+        args.append(before_id)
     return ("WHERE " + " AND ".join(where)) if where else "", args
 
 
@@ -462,23 +465,45 @@ async def delete_message(msg_id: int):
     return {"ok": True}
 
 
+_CSV_BATCH_SIZE = 100
+
+
 @app.get("/api/admin/messages/export.csv", tags=["留言"], dependencies=[admin])
 def export_csv(site_id: int | None = None, status: str | None = None, q: str | None = None):
-    where, args = _msg_filter(site_id, status, q)
-    with get_db() as db:
-        data = rows(db.execute(
-            f"SELECT m.id, s.name AS site, m.name, m.contact, m.content, m.status, m.note, m.page_url, m.ip, m.created_at "
-            f"FROM messages m JOIN sites s ON s.id = m.site_id {where} ORDER BY m.id DESC", args,
-        ))
-    buf = io.StringIO()
-    buf.write("﻿")  # 让 Excel 正确识别 UTF-8
-    w = csv.writer(buf)
-    w.writerow(["ID", "站点", "姓名", "联系方式", "内容", "状态", "备注", "来源页面", "IP", "时间"])
-    for r in data:
-        w.writerow(r.values())
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="text/csv; charset=utf-8",
+    def fetch_batch(before_id=None):
+        where, args = _msg_filter(site_id, status, q, before_id=before_id)
+        with get_db() as db:
+            return db.execute(
+                "SELECT m.id, s.name AS site, m.name, m.contact, m.content, m.status, m.note, m.page_url, m.ip, m.created_at "
+                f"FROM messages m JOIN sites s ON s.id = m.site_id {where} ORDER BY m.id DESC LIMIT ?",
+                [*args, _CSV_BATCH_SIZE],
+            ).fetchall()
+
+    def stream(batch):
+        buf = io.StringIO(newline="")
+        buf.write("\ufeff")  # 让 Excel 正确识别 UTF-8
+        writer = csv.writer(buf)
+        writer.writerow(["ID", "站点", "姓名", "联系方式", "内容", "状态", "备注", "来源页面", "IP", "时间"])
+        yield buf.getvalue()
+        while batch:
+            buf.seek(0)
+            buf.truncate()
+            for row in batch:
+                writer.writerow(_csv_cell(value) for value in row)
+            yield buf.getvalue()
+            if len(batch) < _CSV_BATCH_SIZE:
+                break
+            batch = fetch_batch(batch[-1][0])
+
+    return StreamingResponse(stream(fetch_batch()), media_type="text/csv; charset=utf-8",
                              headers={"Content-Disposition": "attachment; filename=messages.csv"})
+
+
+def _csv_cell(value):
+    if isinstance(value, str) and (value.startswith(("\t", "\r", "\n"))
+                                   or value.lstrip().startswith(("=", "+", "-", "@", "＝", "＋", "－", "＠"))):
+        return "'" + value
+    return value
 
 
 @app.get("/api/admin/messages/{msg_id}", tags=["留言"], dependencies=[admin])
