@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 
 class FakeQQ:
@@ -710,6 +711,57 @@ class QQDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def enable_fake_ai(self):
         self.db.set_settings({'ai_enabled':'1','ai_base_url':'http://fake-provider.invalid/v1',
                               'ai_api_key':'ai-fake-secret-never-expose','ai_model':'test-model','ai_prompt':'Private system instruction'})
+
+    def test_partial_crawl_keeps_unavailable_and_unvisited_knowledge(self):
+        from app import auto
+
+        root = "https://docs.example.com/"
+        help_url, removed_url, unvisited_url = (root + name for name in ("help", "removed", "unvisited"))
+        site = {"id": self.site, "crawl_urls": root}
+        with self.db.get_db() as db:
+            other = db.execute("INSERT INTO sites (name,site_key) VALUES ('Other site','other-site')").lastrowid
+            db.executemany("INSERT INTO kb_pages (site_id,url,text) VALUES (?,?,?)", [
+                (self.site, root, "Old homepage"),
+                (self.site, help_url, "旧版退款帮助中心"),
+                (self.site, removed_url, "Old removed article"),
+                (self.site, unvisited_url, "Old unvisited article"),
+                (other, removed_url, "Other site's article"),
+            ])
+
+        responses = {
+            root + "robots.txt": b"User-agent: *\nDisallow:",
+            root: b'Updated homepage <a href="/help">help</a> <a href="/removed">old article</a>',
+            help_url: 503,
+            removed_url: 410,
+        }
+
+        def fetch(url, _hosts=None):
+            result = responses[url]
+            if isinstance(result, int):
+                raise HTTPError(url, result, "Fixture response", {}, None)
+            return url, "text/html; charset=utf-8", result
+
+        def saved_pages(site_id):
+            with self.db.get_db() as db:
+                return dict(db.execute("SELECT url,text FROM kb_pages WHERE site_id=?", (site_id,)).fetchall())
+
+        with patch.object(auto, "_fetch", side_effect=fetch), patch.object(auto.time, "sleep"):
+            self.assertEqual(auto.crawl(site), {"ok": True, "pages": 1, "errors": 2})
+            self.assertEqual(saved_pages(self.site), {
+                root: "Updated homepage help old article",
+                help_url: "旧版退款帮助中心",
+                unvisited_url: "Old unvisited article",
+            })
+            self.assertIn("旧版退款帮助中心", auto.retrieve_sources(self.site, "退款帮助")[0])
+            self.assertEqual(saved_pages(other), {removed_url: "Other site's article"})
+
+            responses[help_url] = "新版退款帮助中心内容已更新".encode()
+            self.assertEqual(auto.crawl(site), {"ok": True, "pages": 2, "errors": 1})
+            self.assertEqual(saved_pages(self.site)[help_url], "新版退款帮助中心内容已更新")
+
+            responses[root] = 404
+            self.assertFalse(auto.crawl(site)["ok"])
+            self.assertEqual(set(saved_pages(self.site)), {help_url, unvisited_url})
 
     async def test_ai_retrieval_scope_snapshots_and_budget(self):
         from app import auto

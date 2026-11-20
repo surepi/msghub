@@ -668,13 +668,18 @@ def crawl(site: dict) -> dict:
         return rp.can_fetch(UA, url)
 
     queue, seen, pages, errors = [(u, 0) for u in starts], set(starts), [], 0
+    removed_urls = set()
     while queue and len(pages) < CRAWL_MAX_PAGES:
         url, depth = queue.pop(0)
         if not allowed(url):
             continue
         try:
             final, ctype, raw = _fetch(url)
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                if exc.code in (404, 410):
+                    removed_urls.add(exc.geturl())
+                exc.close()
             errors += 1
             continue
         if "html" not in ctype.lower():
@@ -695,12 +700,17 @@ def crawl(site: dict) -> dict:
                     seen.add(link)
                     queue.append((link, depth + 1))
         time.sleep(0.3)
+    if pages or removed_urls:
+        with get_db() as db:
+            if removed_urls:
+                db.executemany("DELETE FROM kb_pages WHERE site_id = ? AND url = ?",
+                               [(site["id"], url) for url in removed_urls])
+            if pages:
+                db.executemany("REPLACE INTO kb_pages (site_id, url, title, text) VALUES (?,?,?,?)",
+                               [(site["id"], p["url"], p["title"], p["text"]) for p in pages])
     if not pages:
-        return {"ok": False, "error": f"没有抓到有效页面（失败 {errors} 次），已保留原有资料"}
-    with get_db() as db:
-        db.execute("DELETE FROM kb_pages WHERE site_id = ?", (site["id"],))
-        db.executemany("INSERT OR REPLACE INTO kb_pages (site_id, url, title, text) VALUES (?,?,?,?)",
-                       [(site["id"], p["url"], p["title"], p["text"]) for p in pages])
+        detail = "仅清理了返回 404 或 410 的页面" if removed_urls else "已保留原有资料"
+        return {"ok": False, "error": f"没有抓到有效页面（失败 {errors} 次），{detail}"}
     set_settings({f"crawl_at_{site['id']}": str(int(time.time()))})
     return {"ok": True, "pages": len(pages), "errors": errors}
 
