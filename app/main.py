@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import io
 import json
@@ -58,6 +59,32 @@ async def _startup():
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+_readiness_check: asyncio.Task[bool] | None = None
+
+
+def _database_reachable() -> bool:
+    try:
+        with get_db() as db:
+            db.execute("SELECT 1").fetchone()
+    except Exception:
+        return False
+    return True
+
+
+@app.get("/api/ready", include_in_schema=False)
+async def readiness():
+    global _readiness_check
+    if _readiness_check is None or _readiness_check.done():
+        _readiness_check = asyncio.create_task(asyncio.to_thread(_database_reachable))
+    try:
+        # Let a timed-out check finish without starting more database connections.
+        ready = await asyncio.wait_for(asyncio.shield(_readiness_check), timeout=2)
+    except TimeoutError:
+        ready = False
+    return JSONResponse({"ok": ready}, status_code=200 if ready else 503,
+                        headers={"Cache-Control": "no-store"})
 
 
 def _file(request: Request, path: Path, media_type: str | None = None) -> Response:

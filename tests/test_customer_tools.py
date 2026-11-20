@@ -137,6 +137,12 @@ class CustomerToolsTests(unittest.TestCase):
                 pass
             return self.request("GET", f"/api/admin/conversations?site_id={site['id']}")[1]["items"][0]
 
+    def test_database_readiness_is_not_cached(self):
+        with urllib.request.urlopen(self.base + "/api/ready", timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertEqual(json.load(response), {"ok": True})
+
     def test_tag_catalog_validation_and_restart(self):
         catalog = self.request("GET", "/api/admin/tags")[1]
         self.assertTrue({"待报价", "售后", "投诉", "重点客户", "已转化"}.issubset(
