@@ -332,7 +332,7 @@ def create_site(body: SiteIn):
 
 
 @app.put("/api/admin/sites/{site_id}", tags=["站点"], dependencies=[admin])
-def update_site(site_id: int, body: SiteIn):
+async def update_site(site_id: int, body: SiteIn):
     values = _site_values(body)
     with get_db() as db:
         cur = db.execute(
@@ -341,22 +341,27 @@ def update_site(site_id: int, body: SiteIn):
         )
         if not cur.rowcount:
             raise HTTPException(404, "站点不存在")
+        site = dict(db.execute("SELECT site_key, enabled, allowed_origins FROM sites WHERE id=?",
+                               (site_id,)).fetchone())
+    await chat.hub.revoke_site_visitors(site_id, site)
     return {"ok": True}
 
 
 @app.post("/api/admin/sites/{site_id}/rotate-key", tags=["站点"], dependencies=[admin])
-def rotate_key(site_id: int):
+async def rotate_key(site_id: int):
     key = "sk_" + secrets.token_urlsafe(24)
     with get_db() as db:
         if not db.execute("UPDATE sites SET site_key=? WHERE id=?", (key, site_id)).rowcount:
             raise HTTPException(404, "站点不存在")
+    await chat.hub.revoke_site_visitors(site_id)
     return {"site_key": key}
 
 
 @app.delete("/api/admin/sites/{site_id}", tags=["站点"], dependencies=[admin])
-def delete_site(site_id: int):
+async def delete_site(site_id: int):
     with get_db() as db:
         db.execute("DELETE FROM sites WHERE id=?", (site_id,))
+    await chat.hub.revoke_site_visitors(site_id)
     return {"ok": True}
 
 

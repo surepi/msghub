@@ -28,6 +28,7 @@ import secrets
 import sqlite3
 from collections import defaultdict
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import date
 from typing import Awaitable, Callable, Literal
 
@@ -56,9 +57,17 @@ _new_visitor_by_ip = RateLimiter(10)   # 每个 IP 每分钟最多新建 10 个�
 # 实时连接表
 # ---------------------------------------------------------------------------
 
+@dataclass
+class VisitorConnection:
+    site_id: int
+    site_key: str
+    conv_id: int | None = None
+
+
 class Hub:
     def __init__(self):
         self.visitors: dict[int, set[WebSocket]] = defaultdict(set)  # 会话 ID -> 访客连接（可能多个标签页）
+        self.visitor_connections: dict[WebSocket, VisitorConnection] = {}
         self.admins: set[WebSocket] = set()
 
     @staticmethod
@@ -73,11 +82,17 @@ class Hub:
         """推给该会话的所有访客连接，返回送达的连接数。"""
         sent = 0
         for ws in list(self.visitors.get(conv_id, ())):
-            if await self._send(ws, data):
+            if await self.send_visitor(ws, data):
                 sent += 1
             else:
-                self.visitors[conv_id].discard(ws)
+                self.leave(ws)
         return sent
+
+    async def send_visitor(self, ws: WebSocket, data: dict) -> bool:
+        if ws not in self.visitor_connections:
+            return False
+        sent = await self._send(ws, data)
+        return sent and ws in self.visitor_connections
 
     async def to_admins(self, data: dict):
         for ws in list(self.admins):
@@ -87,15 +102,37 @@ class Hub:
     def visitor_online(self, conv_id: int) -> bool:
         return bool(self.visitors.get(conv_id))
 
+    def track_visitor(self, ws: WebSocket, site: dict):
+        self.visitor_connections[ws] = VisitorConnection(site["id"], site["site_key"])
+
     def join(self, conv_id: int, ws: WebSocket):
+        self.visitor_connections[ws].conv_id = conv_id
         self.visitors[conv_id].add(ws)
 
-    def leave(self, conv_id: int, ws: WebSocket):
-        conns = self.visitors.get(conv_id)
-        if conns is not None:
-            conns.discard(ws)
-            if not conns:
-                del self.visitors[conv_id]
+    def leave(self, ws: WebSocket):
+        connection = self.visitor_connections.pop(ws, None)
+        if connection is None or connection.conv_id is None:
+            return
+        conns = self.visitors[connection.conv_id]
+        conns.discard(ws)
+        if not conns:
+            del self.visitors[connection.conv_id]
+
+    async def close_visitors(self, sockets: list[WebSocket], code: int):
+        # Revoke all affected sockets before awaiting any network operation.
+        for ws in sockets:
+            self.leave(ws)
+        await asyncio.gather(*(ws.close(code) for ws in sockets), return_exceptions=True)
+
+    async def revoke_site_visitors(self, site_id: int, site: dict | None = None):
+        affected = [
+            ws for ws, connection in self.visitor_connections.items()
+            if connection.site_id == site_id and (
+                not site or not site["enabled"] or site["site_key"] != connection.site_key
+                or not origin_allowed(site, ws.headers.get("origin", ""), ws.headers)
+            )
+        ]
+        await self.close_visitors(affected, 4403)
 
 
 hub = Hub()
@@ -271,7 +308,8 @@ def add_message(conv_id: int, sender: str, content: str, page_url: str = "", msg
 async def broadcast_message(conv_id: int, msg: dict, client_id: str = ""):
     """把一条新消息推给访客和所有在线的客服后台。"""
     await hub.to_visitor(conv_id, {"type": "msg", "message": msg, "client_id": client_id})
-    await hub.to_admins({"type": "msg", "conversation": conv_summary(conv_id), "message": msg})
+    if summary := conv_summary(conv_id):
+        await hub.to_admins({"type": "msg", "conversation": summary, "message": msg})
 
 
 async def agent_reply(conv_id: int, content: str, msg_type: str = "text") -> tuple[dict, bool]:
@@ -352,56 +390,65 @@ async def visitor_ws(ws: WebSocket):
     # 访客身份在填写资料或第一次发消息时才创建，只打开挂件不会产生数据
     visitor = find_visitor(str(hello.get("token", "")))
     conv = find_conversation(site["id"], visitor["id"]) if visitor else None
-    if conv:
-        hub.join(conv["id"], ws)
-        await hub.to_admins({"type": "conv", "conversation": conv_summary(conv["id"])})
-    await hub._send(ws, {
-        "type": "init",
-        "site": site_public_config(site),
-        "profile": _profile(visitor),
-        "conversation": {"id": conv["id"], "status": conv["status"]} if conv else None,
-        "ai_handoff": bool(conv and conv["ai_waiting_for_agent"]),
-        "messages": history(conv["id"]) if conv else [],
-    })
+
+    async def send(data: dict) -> bool:
+        return await hub.send_visitor(ws, data)
 
     async def ensure_visitor(client_id: str = "") -> bool:
         nonlocal visitor
         if visitor:
             return True
         if not _new_visitor_by_ip.allow(ip):
-            await hub._send(ws, {"type": "error", "error": "操作过于频繁，请稍后再试", "client_id": client_id})
+            await send({"type": "error", "error": "操作过于频繁，请稍后再试", "client_id": client_id})
             return False
         visitor = create_visitor(ip, ua, page_url)
-        await hub._send(ws, {"type": "token", "token": visitor["token"]})
-        return True
+        return await send({"type": "token", "token": visitor["token"]})
 
+    hub.track_visitor(ws, site)
     try:
-        while True:
+        if conv:
+            hub.join(conv["id"], ws)
+            await hub.to_admins({"type": "conv", "conversation": conv_summary(conv["id"])})
+        if ws not in hub.visitor_connections:
+            return
+        if not await send({
+            "type": "init",
+            "site": site_public_config(site),
+            "profile": _profile(visitor),
+            "conversation": {"id": conv["id"], "status": conv["status"]} if conv else None,
+            "ai_handoff": bool(conv and conv["ai_waiting_for_agent"]),
+            "messages": history(conv["id"]) if conv else [],
+        }):
+            return
+
+        while ws in hub.visitor_connections:
             data = await ws.receive_json()
+            if ws not in hub.visitor_connections:
+                return
             if not isinstance(data, dict):
                 continue
             kind = data.get("type")
             if kind == "ping":
-                await hub._send(ws, {"type": "pong"})
+                await send({"type": "pong"})
                 continue
 
             if kind == "profile":
                 name = str(data.get("name", "")).strip()[:MAX_NAME]
                 contact = str(data.get("contact", "")).strip()[:MAX_CONTACT]
                 if not name:
-                    await hub._send(ws, {"type": "error", "error": "请填写称呼", "field": "name"})
+                    await send({"type": "error", "error": "请填写称呼", "field": "name"})
                     continue
                 if not valid_contact(contact):
-                    await hub._send(ws, {"type": "error", "error": "请填写正确的电话或邮箱", "field": "contact"})
+                    await send({"type": "error", "error": "请填写正确的电话或邮箱", "field": "contact"})
                     continue
                 if not await ensure_visitor():
                     continue
                 with get_db() as db:
                     db.execute("UPDATE visitors SET name = ?, contact = ? WHERE id = ?", (name, contact, visitor["id"]))
                 visitor = {**visitor, "name": name, "contact": contact}
-                await hub._send(ws, {"type": "profile_ok", "profile": _profile(visitor)})
-                if conv:
-                    await hub.to_admins({"type": "conv", "conversation": conv_summary(conv["id"])})
+                await send({"type": "profile_ok", "profile": _profile(visitor)})
+                if conv and (summary := conv_summary(conv["id"])):
+                    await hub.to_admins({"type": "conv", "conversation": summary})
                 continue
 
             if kind != "msg":
@@ -413,18 +460,18 @@ async def visitor_ws(ws: WebSocket):
             if not content:
                 continue
             if msg_type == "image" and not media.local_path(content):
-                await hub._send(ws, {"type": "error", "error": "图片无效，请重新上传", "client_id": client_id})
+                await send({"type": "error", "error": "图片无效，请重新上传", "client_id": client_id})
                 continue
             if len(content) > MAX_CONTENT:
-                await hub._send(ws, {"type": "error", "error": f"单条消息不能超过 {MAX_CONTENT} 字", "client_id": client_id})
+                await send({"type": "error", "error": f"单条消息不能超过 {MAX_CONTENT} 字", "client_id": client_id})
                 continue
             site = find_site(site["site_key"]) or site   # 设置可能刚被修改
             if site.get("require_contact", 1) and not _profile_complete(visitor):
-                await hub._send(ws, {"type": "error", "error": "请先填写称呼和联系方式", "client_id": client_id,
-                                     "need_profile": True})
+                await send({"type": "error", "error": "请先填写称呼和联系方式", "client_id": client_id,
+                            "need_profile": True})
                 continue
             if not _msg_by_ip.allow(ip) or (visitor and not _msg_by_visitor.allow(str(visitor["id"]))):
-                await hub._send(ws, {"type": "error", "error": "发送过于频繁，请稍后再试", "client_id": client_id})
+                await send({"type": "error", "error": "发送过于频繁，请稍后再试", "client_id": client_id})
                 continue
             if not await ensure_visitor(client_id):
                 continue
@@ -450,9 +497,9 @@ async def visitor_ws(ws: WebSocket):
     except Exception as e:  # noqa: BLE001  无效 JSON 等
         print(f"[chat] 访客连接异常: {e!r}", flush=True)
     finally:
-        if conv:
-            hub.leave(conv["id"], ws)
-            await hub.to_admins({"type": "conv", "conversation": conv_summary(conv["id"])})
+        hub.leave(ws)
+        if conv and (summary := conv_summary(conv["id"])):
+            await hub.to_admins({"type": "conv", "conversation": summary})
 
 
 # ---------------------------------------------------------------------------
@@ -913,10 +960,6 @@ async def set_status(conv_id: int, body: StatusIn):
 async def delete_conversation(conv_id: int):
     with get_db() as db:
         db.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
-    for ws in list(hub.visitors.pop(conv_id, ())):
-        try:
-            await ws.close(4410)
-        except Exception:
-            pass
+    await hub.close_visitors(list(hub.visitors.get(conv_id, ())), 4410)
     await hub.to_admins({"type": "conv_deleted", "id": conv_id})
     return {"ok": True}

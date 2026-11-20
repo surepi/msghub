@@ -17,6 +17,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import ExitStack
 from datetime import datetime
 from urllib.parse import urlencode
 
@@ -136,6 +137,78 @@ class CustomerToolsTests(unittest.TestCase):
             while json.loads(ws.recv())["type"] != "msg":
                 pass
             return self.request("GET", f"/api/admin/conversations?site_id={site['id']}")[1]["items"][0]
+
+    def test_site_changes_revoke_only_affected_visitor_connections(self):
+        from websockets.exceptions import ConnectionClosed
+
+        site, other = self.sites
+        path = f"/api/admin/sites/{site['id']}"
+        allowed, removed = "https://allowed.example", "https://removed.example"
+
+        def configure(origins, enabled=True):
+            self.assertEqual(self.request("PUT", path, {
+                "name": site["name"], "require_contact": False, "ai_enabled": False,
+                "enabled": enabled, "allowed_origins": origins,
+            })[0], 200)
+
+        def connect_visitor(sockets, key, origin, token=""):
+            ws = sockets.enter_context(connect(self.ws_base + "/api/chat/ws", origin=origin))
+            ws.send(json.dumps({"type": "hello", "site_key": key, "token": token}))
+            return ws, json.loads(ws.recv(timeout=3))
+
+        def assert_revoked(ws):
+            with self.assertRaises(ConnectionClosed) as closed:
+                ws.recv(timeout=3)
+            self.assertEqual(closed.exception.rcvd.code, 4403)
+
+        def assert_online(ws):
+            ws.send('{"type":"ping"}')
+            self.assertEqual(json.loads(ws.recv(timeout=3))["type"], "pong")
+
+        message = "hello from the original connection"
+        cid, _ = self.seed_search_conversation(site, messages=[(message, datetime.now().isoformat(sep=" "), "text")])
+        with sqlite3.connect(Path(self.tmp.name) / "msghub.db") as db:
+            token = db.execute(
+                "SELECT token FROM visitors WHERE id=(SELECT visitor_id FROM conversations WHERE id=?)",
+                (cid,),
+            ).fetchone()[0]
+        configure(f"{allowed},{removed}")
+        with ExitStack() as sockets:
+            original, init = connect_visitor(sockets, site["site_key"], allowed, token)
+            self.assertEqual(init["conversation"]["id"], cid)
+            rejected, _ = connect_visitor(sockets, site["site_key"], removed)
+            unaffected, _ = connect_visitor(sockets, other["site_key"], removed)
+
+            configure(allowed)
+            assert_revoked(rejected)
+            assert_online(original)
+            assert_online(unaffected)
+
+            idle, init = connect_visitor(sockets, site["site_key"], allowed)
+            self.assertIsNone(init["conversation"])
+            status, rotated = self.request("POST", path + "/rotate-key")
+            self.assertEqual(status, 200)
+            assert_revoked(original)
+            assert_revoked(idle)
+            stale, error = connect_visitor(sockets, site["site_key"], allowed, token)
+            self.assertEqual(error["type"], "error")
+            assert_revoked(stale)
+
+            restored, init = connect_visitor(sockets, rotated["site_key"], allowed, token)
+            self.assertEqual(init["messages"][0]["content"], message)
+            self.assertEqual(init["conversation"]["id"], cid)
+            status, reply = self.request("POST", f"/api/admin/conversations/{cid}/messages", {"content": "Current reply"})
+            self.assertEqual(status, 200)
+            self.assertTrue(reply["delivered"])
+            self.assertEqual(json.loads(restored.recv(timeout=3))["message"]["content"], "Current reply")
+            self.assertEqual(json.loads(restored.recv(timeout=3))["type"], "status")
+
+            configure(allowed, enabled=False)
+            assert_revoked(restored)
+            disabled, error = connect_visitor(sockets, rotated["site_key"], allowed)
+            self.assertEqual(error["type"], "error")
+            assert_revoked(disabled)
+            assert_online(unaffected)
 
     def test_database_readiness_is_not_cached(self):
         with urllib.request.urlopen(self.base + "/api/ready", timeout=5) as response:

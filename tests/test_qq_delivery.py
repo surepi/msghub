@@ -417,6 +417,41 @@ class QQDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await self.delivery.flush_backlog()
         self.assertEqual(len(self.fake.calls),1)
 
+    async def test_site_revocation_skips_sockets_in_a_pending_broadcast(self):
+        from unittest.mock import AsyncMock, Mock
+        from app.chat import Hub
+
+        hub = Hub()
+        site = {"id": 1, "site_key": "old-key"}
+        sockets = [Mock(spec=["send_json", "close"]) for _ in range(2)]
+        for ws in sockets:
+            ws.send_json = AsyncMock()
+            ws.close = AsyncMock()
+            hub.track_visitor(ws, site)
+            hub.join(1, ws)
+        first = next(iter(hub.visitors[1]))
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def blocked_send(_):
+            started.set()
+            await release.wait()
+
+        first.send_json.side_effect = blocked_send
+        pending = asyncio.create_task(hub.to_visitor(1, {"type": "msg"}))
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            await hub.revoke_site_visitors(1)
+            self.assertFalse(hub.visitor_online(1))
+            for ws in sockets:
+                ws.close.assert_awaited_once_with(4403)
+                if ws is not first:
+                    ws.send_json.assert_not_awaited()
+        finally:
+            release.set()
+        self.assertEqual(await asyncio.wait_for(pending, 1), 0)
+        for ws in sockets:
+            self.assertEqual(ws.send_json.await_count, int(ws is first))
+
     async def test_handoff_snapshot_dedup_archive_merge_and_quote(self):
         from unittest.mock import AsyncMock
         from app import auto
