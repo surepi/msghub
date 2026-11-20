@@ -46,7 +46,6 @@ admin = Depends(auth.require_admin)
 CONVERSATION_CLOSED_TEXT = "对话已结束。如还有问题，直接发送消息即可重新联系客服。"
 HELLO_TIMEOUT = 10
 HISTORY_LIMIT = 100
-SENDERS = ("visitor", "agent", "ai", "system")
 
 _msg_by_visitor = RateLimiter(20)      # 每个访客每分钟最多 20 条
 _msg_by_ip = RateLimiter(60)           # 每个 IP 每分钟最多 60 条

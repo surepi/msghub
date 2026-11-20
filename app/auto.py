@@ -125,10 +125,6 @@ def retrieve_sources(site_id: int, query: str, limit_chars: int = 3500) -> tuple
     return '\n\n'.join(out), sources
 
 
-def retrieve(site_id: int, query: str, limit_chars: int = 3500) -> str:
-    return retrieve_sources(site_id, query, limit_chars)[0]
-
-
 # ---------------------------------------------------------------------------
 # 大模型（OpenAI 兼容接口）
 # ---------------------------------------------------------------------------

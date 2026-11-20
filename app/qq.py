@@ -278,27 +278,6 @@ async def deliver(text: str, conv_id: int | None = None, openid: str = "", *, bi
         return ids, ""
 
 
-async def deliver_image(path: str, conv_id: int | None = None) -> tuple[str, str]:
-    """把站内图片发给客服。QQ 只支持 png/jpg，其他格式返回失败原因由调用方改发文字提示。"""
-    local = media.local_path(path)
-    if not local:
-        return "", "图片不存在"
-    if local.suffix.lower() not in (".png", ".jpg"):
-        return "", f"QQ 不支持 {local.suffix[1:].upper()} 格式"
-    async with _send_lock:
-        openid = agent()["openid"]
-        if not openid:
-            return "", "尚未绑定客服"
-        try:
-            file_info = await client.upload_image(openid, local.read_bytes())
-            return await _send_one(openid, {"msg_type": 7, "media": {"file_info": file_info}}, conv_id), ""
-        except QQApiError as e:
-            return "", '发送图片失败：' + safe_error(e)
-        except Exception as e:  # noqa: BLE001
-            log('发送图片异常：' + safe_error(e))
-            return "", '发送图片异常：' + safe_error(e)
-
-
 async def notify(text: str, conv_id: int | None = None):
     """给客服发提醒（AI 回复、转人工等）；未绑定时忽略。"""
     if agent()["openid"]:
