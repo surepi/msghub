@@ -18,6 +18,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime
 from urllib.parse import urlencode
@@ -323,6 +324,71 @@ class CustomerToolsTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers["Cache-Control"], "no-store")
             self.assertEqual(json.load(response), {"ok": True})
+
+    def test_database_write_wait_does_not_block_another_site_heartbeat(self):
+        site, other = self.sites
+        database = Path(self.tmp.name) / "msghub.db"
+        with sqlite3.connect(database) as db:
+            token = os.urandom(16).hex()
+            db.execute("INSERT INTO visitors (site_id,token) VALUES (?,?)", (site["id"], token))
+
+        url = self.ws_base + "/api/chat/ws"
+        with connect(url) as writer, connect(url) as reader, ThreadPoolExecutor(max_workers=1) as executor:
+            writer.send(json.dumps({"type": "hello", "site_key": site["site_key"], "token": token}))
+            reader.send(json.dumps({"type": "hello", "site_key": other["site_key"]}))
+            self.assertEqual(json.loads(writer.recv(timeout=3))["type"], "init")
+            self.assertEqual(json.loads(reader.recv(timeout=3))["type"], "init")
+
+            def expect_heartbeat():
+                reader.send('{"type":"ping"}')
+                self.assertEqual(json.loads(reader.recv(timeout=1.5))["type"], "pong")
+
+            with sqlite3.connect(database) as lock:
+                lock.execute("BEGIN IMMEDIATE")
+                try:
+                    form = executor.submit(self.request, "POST", "/api/public/messages",
+                                           {"site_key": site["site_key"], "content": "Queued form"}, False)
+                    with self.assertRaises(TimeoutError):
+                        form.result(timeout=.15)
+                    expect_heartbeat()
+                finally:
+                    lock.rollback()
+            self.assertEqual(form.result(timeout=3)[0], 200)
+
+            with sqlite3.connect(database) as lock:
+                lock.execute("BEGIN IMMEDIATE")
+                try:
+                    writer.send('{"type":"msg","content":"Queued visitor message","client_id":"slow-write"}')
+                    with self.assertRaises(TimeoutError):
+                        writer.recv(timeout=.15)
+                    expect_heartbeat()
+                finally:
+                    lock.rollback()
+            self.assertEqual(json.loads(writer.recv(timeout=3))["client_id"], "slow-write")
+
+            with sqlite3.connect(database) as lock:
+                conv_id = lock.execute(
+                    "SELECT c.id FROM conversations c JOIN visitors v ON v.id=c.visitor_id WHERE v.token=?",
+                    (token,),
+                ).fetchone()[0]
+                lock.execute("BEGIN IMMEDIATE")
+                try:
+                    closing = executor.submit(
+                        self.request, "POST", f"/api/admin/conversations/{conv_id}/status", {"status": "closed"}
+                    )
+                    with self.assertRaises(TimeoutError):
+                        closing.result(timeout=.15)
+                    expect_heartbeat()
+                finally:
+                    lock.rollback()
+            self.assertEqual(closing.result(timeout=3)[0], 200)
+            self.assertEqual(self.request("POST", f"/api/admin/conversations/{conv_id}/status", {"status": "closed"})[0], 200)
+            with sqlite3.connect(database) as db:
+                self.assertEqual(db.execute("SELECT status FROM conversations WHERE id=?", (conv_id,)).fetchone()[0],
+                                 "closed")
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM chat_messages WHERE conversation_id=? AND sender='system'", (conv_id,)
+                ).fetchone()[0], 1)
 
     def test_export_keeps_filters_and_order_across_batches(self):
         site_id = self.sites[0]["id"]

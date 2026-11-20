@@ -5,6 +5,8 @@ import hashlib
 import json
 import time
 
+from fastapi.concurrency import run_in_threadpool
+
 from . import chat
 from .db import NOW_SQL, begin_write, get_db, insert_once
 
@@ -26,6 +28,9 @@ def accept(app_id: str, event_id: str, payload: dict) -> None:
             (key, app_id, body, time.time()),
         )
         db.execute(f"UPDATE qq_agent SET last_event_at={NOW_SQL} WHERE id=1")
+
+
+def wake() -> None:
     if _wake is not None:
         _wake.set()
 
@@ -53,10 +58,13 @@ def commit_reply(event: dict, openid: str, target: int, implicit: bool,
         if not db.execute("SELECT 1 FROM conversations WHERE id=?", (target,)).fetchone():
             finish(db, event["id"])
             return [], f"会话 #{target} 不存在"
-        messages = [chat.add_message(target, "agent", content, msg_type=kind, db=db)
-                    for kind, content in contents]
         same_default = (owner["current_conv_id"] == event["default_conv_id"]
                         and owner["current_set_at"] == event["default_set_at"])
+        if implicit and not same_default:
+            finish(db, event["id"])
+            return [], "当前会话刚切换，未发送。请引用原消息，或用「#编号 内容」回复。"
+        messages = [chat.add_message(target, "agent", content, msg_type=kind, db=db)
+                    for kind, content in contents]
         if messages and not implicit and not event["attempts"] and same_default and owner["current_conv_id"] != target:
             db.execute("UPDATE qq_agent SET current_conv_id=?,current_set_at=0 WHERE id=1", (target,))
         finish(db, event["id"])
@@ -72,30 +80,42 @@ async def process_one() -> bool:
     """One worker processes accepted events. A crash before commit leaves the row pending."""
     from . import qq
 
-    with get_db() as db:
-        row = db.execute(
-            "SELECT * FROM qq_inbound WHERE status='pending' AND next_attempt_at<=? ORDER BY id LIMIT 1",
-            (time.time(),),
-        ).fetchone()
+    def next_event():
+        with get_db() as db:
+            return db.execute(
+                "SELECT * FROM qq_inbound WHERE status='pending' AND next_attempt_at<=? ORDER BY id LIMIT 1",
+                (time.time(),),
+            ).fetchone()
+
+    row = await run_in_threadpool(next_event)
     if row is None:
         return False
     if row["app_id"] != qq.QQ_APP_ID:
-        with get_db() as db:
-            db.execute("UPDATE qq_inbound SET status='cancelled',payload=NULL WHERE id=?", (row["id"],))
+        def cancel():
+            with get_db() as db:
+                db.execute("UPDATE qq_inbound SET status='cancelled',payload=NULL WHERE id=?", (row["id"],))
+
+        await run_in_threadpool(cancel)
         return True
     try:
         await qq.handle_c2c(json.loads(row["payload"]), inbound=dict(row))
-        with get_db() as db:
-            finish(db, row["id"])
+        def complete():
+            with get_db() as db:
+                finish(db, row["id"])
+
+        await run_in_threadpool(complete)
     except Exception as exc:
         attempts = row["attempts"] + 1
         status = "failed" if attempts >= MAX_ATTEMPTS else "pending"
-        with get_db() as db:
-            updated = db.execute(
-                "UPDATE qq_inbound SET status=?,attempts=?,next_attempt_at=?,"
-                "payload=CASE WHEN ?='failed' THEN NULL ELSE payload END WHERE id=? AND status='pending'",
-                (status, attempts, time.time() + min(60, 2 ** attempts), status, row["id"]),
-            ).rowcount
+        def record_failure():
+            with get_db() as db:
+                return db.execute(
+                    "UPDATE qq_inbound SET status=?,attempts=?,next_attempt_at=?,"
+                    "payload=CASE WHEN ?='failed' THEN NULL ELSE payload END WHERE id=? AND status='pending'",
+                    (status, attempts, time.time() + min(60, 2 ** attempts), status, row["id"]),
+                ).rowcount
+
+        updated = await run_in_threadpool(record_failure)
         if updated:
             qq.log(f"接收任务 #{row['id']} {status}，第 {attempts} 次处理异常：{type(exc).__name__}")
         else:

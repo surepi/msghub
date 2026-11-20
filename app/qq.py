@@ -23,6 +23,7 @@ import urllib.request
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from . import auth, auto, chat, media, qq_inbound
@@ -117,9 +118,11 @@ class QQSendUncertain(Exception):
     """A send may have reached QQ; a blind retry could duplicate it."""
 
 
-def safe_error(exc) -> str:
+def safe_error(exc, *, openid=None) -> str:
     text = str(exc)
-    for value in (QQ_APP_SECRET, client._token, agent()['openid']):
+    if openid is None:
+        openid = agent()['openid']
+    for value in (QQ_APP_SECRET, client._token, openid):
         if value:
             text = text.replace(value, '[已隐藏]')
     return text[:500]
@@ -158,7 +161,7 @@ class QQClient:
                 status, d = await asyncio.to_thread(
                     _http, "POST", QQ_TOKEN_URL, {"appId": QQ_APP_ID, "clientSecret": QQ_APP_SECRET}, {})
             except Exception as exc:
-                raise QQApiError(None, '获取 QQ 凭据时网络错误：' + safe_error(exc)) from exc
+                raise QQApiError(None, '获取 QQ 凭据时网络错误：' + await run_in_threadpool(safe_error, exc)) from exc
             if "access_token" not in d:
                 raise QQApiError(d.get("code"), d.get("message") or "获取 access_token 失败", status)
             self._token = d["access_token"]
@@ -204,22 +207,38 @@ _send_lock = asyncio.Lock()   # 串行发送：保证顺序，也避免被动回
 # 客服状态
 # ---------------------------------------------------------------------------
 
-def agent() -> dict:
-    with get_db() as db:
+def agent(*, db=None) -> dict:
+    with (get_db() if db is None else nullcontext(db)) as db:
         return dict(db.execute("SELECT * FROM qq_agent WHERE id = 1").fetchone())
 
 
-def update_agent(*, db=None, **fields):
+def update_agent(*, db=None, binding=None, **fields):
     if not fields:
         return
     cols = ", ".join(f"{k} = ?" for k in fields)
+    sql = f"UPDATE qq_agent SET {cols} WHERE id = 1"
+    params = list(fields.values())
+    if binding is not None:
+        sql += " AND openid=? AND binding_version=?"
+        params.extend(binding)
     with (get_db() if db is None else nullcontext(db)) as db:
-        db.execute(f"UPDATE qq_agent SET {cols} WHERE id = 1", list(fields.values()))
+        return db.execute(sql, params).rowcount
 
 
 def passive_available(a: dict) -> bool:
     return bool(a["last_msg_id"]) and time.time() - a["last_msg_at"] < QQ_PASSIVE_WINDOW \
         and a["passive_used"] < QQ_PASSIVE_MAX
+
+
+def _reserve_passive(openid: str):
+    with get_db() as db:
+        begin_write(db)
+        owner = agent(db=db)
+        if openid != owner["openid"] or not passive_available(owner):
+            return None
+        seq = owner["passive_used"] + 1
+        update_agent(db=db, passive_used=seq)
+        return owner["last_msg_id"], seq
 
 
 def _chunks(text: str) -> list[str]:
@@ -234,32 +253,32 @@ async def _send_one(openid: str, body: dict, conv_id: int | None) -> str:
             d = await client.send_c2c(openid, body=body)
         except QQApiError as exc:
             if exc.status >= 500:
-                raise QQSendUncertain('QQ 服务异常，发送结果未确认：' + safe_error(exc)) from exc
-            a = agent()
-            if not passive_available(a) or openid != a["openid"]:
+                raise QQSendUncertain('QQ 服务异常，发送结果未确认：' + safe_error(exc, openid=openid)) from exc
+            passive = await run_in_threadpool(_reserve_passive, openid)
+            if not passive:
                 raise
-            seq = a["passive_used"] + 1
-            update_agent(passive_used=seq)
-            d = await client.send_c2c(openid, body=body, msg_id=a["last_msg_id"], msg_seq=seq)
+            d = await client.send_c2c(openid, body=body, msg_id=passive[0], msg_seq=passive[1])
     except QQApiError as exc:
         if exc.status >= 500:
-            raise QQSendUncertain('QQ 服务异常，发送结果未确认：' + safe_error(exc)) from exc
+            raise QQSendUncertain('QQ 服务异常，发送结果未确认：' + safe_error(exc, openid=openid)) from exc
         raise
     except QQSendUncertain:
         raise
     except Exception as exc:
-        raise QQSendUncertain('请求未取得明确响应，请先核对 QQ 收件情况：' + safe_error(exc)) from exc
+        raise QQSendUncertain('请求未取得明确响应，请先核对 QQ 收件情况：' + safe_error(exc, openid=openid)) from exc
     extra = d.get('ext_info') if isinstance(d, dict) else None
     refs = [d.get('id') if isinstance(d, dict) else None,
             extra.get('ref_idx') if isinstance(extra, dict) else None]
     if not any(refs):
         raise QQSendUncertain('QQ 未返回可确认的消息编号，请先核对收件情况')
     if conv_id:
-        try:
+        def save_references():
             with get_db() as db:
                 for ref in filter(None, refs):
                     db.execute("REPLACE INTO qq_forwards (qq_msg_id, conversation_id) VALUES (?, ?)",
                                (str(ref), conv_id))
+        try:
+            await run_in_threadpool(save_references)
         except Exception as exc:
             raise QQSendUncertain('QQ 已响应，但本地引用记录保存失败，请先核对收件情况') from exc
     return str(next(ref for ref in refs if ref))
@@ -268,7 +287,7 @@ async def _send_one(openid: str, body: dict, conv_id: int | None) -> str:
 async def deliver(text: str, conv_id: int | None = None, openid: str = "", *, binding_version: int | None = None) -> tuple[list[str], str]:
     """发文字给客服。返回 (成功发出的 QQ 消息 ID 列表, 失败原因)。发出的消息记入 qq_forwards 供引用回复定位。"""
     async with _send_lock:
-        owner = agent()
+        owner = await run_in_threadpool(agent)
         if binding_version is not None and (owner["openid"] != openid or owner["binding_version"] != binding_version):
             return [], "客服绑定已变更"
         openid = openid or owner["openid"]
@@ -279,17 +298,17 @@ async def deliver(text: str, conv_id: int | None = None, openid: str = "", *, bi
             try:
                 ids.append(await _send_one(openid, {"content": part, "msg_type": 0}, conv_id))
             except QQApiError as e:
-                return ids, '发送失败：' + safe_error(e)
+                return ids, '发送失败：' + safe_error(e, openid=openid)
             except Exception as e:  # noqa: BLE001  网络错误
-                log('发送异常：' + safe_error(e))
-                return ids, '发送异常：' + safe_error(e)
+                error = '发送异常：' + safe_error(e, openid=openid)
+                log(error)
+                return ids, error
         return ids, ""
 
 
 async def notify(text: str, conv_id: int | None = None):
     """给客服发提醒（AI 回复、转人工等）；未绑定时忽略。"""
-    if agent()["openid"]:
-        await deliver(text, conv_id)
+    await deliver(text, conv_id)
 
 
 async def reply_to(openid: str, msg_id: str, text: str):
@@ -316,7 +335,7 @@ def _spawn(coro):
 
 async def on_visitor_message(conv: dict, msg: dict):
     """Schedule forwarding for a visitor message already stored with its queue state."""
-    if not agent()["openid"]:
+    if not (await run_in_threadpool(agent))["openid"]:
         return
     conv_id = conv["id"]
     if conv_id not in _flush_timers:
@@ -362,7 +381,7 @@ async def _backlog_loop():
         while True:
             _backlog_wake.clear()
             try:
-                if agent()["openid"]:
+                if (await run_in_threadpool(agent))["openid"]:
                     await flush_backlog()
             except Exception as exc:
                 log(f"积压重试异常：{type(exc).__name__}")
@@ -386,48 +405,67 @@ def _conv_line(c: dict, current: int | None) -> str:
 
 
 async def handle_command(content: str, a: dict):
+    from .qq_delivery import queue_lock
+
     m = re.match(r"^/(\S+?)\s*(?:#?(\d+))?\s*$", content)
     cmd, arg = (m.group(1), int(m.group(2)) if m.group(2) else None) if m else ("", None)
+    binding = a["openid"], a["binding_version"]
+
     async def say(text):
-        await deliver(text, openid=a["openid"], binding_version=a["binding_version"])
+        await deliver(text, openid=binding[0], binding_version=binding[1])
+
+    async def still_bound():
+        owner = await run_in_threadpool(agent)
+        return (owner["openid"], owner["binding_version"]) == binding
 
     if cmd in ("帮助", "help", "h", "?"):
         return await say(HELP)
     if cmd == "列表":
-        with get_db() as db:
-            items = rows(db.execute(
-                chat.CONV_SUMMARY_SQL + "WHERE c.status != 'closed' ORDER BY c.last_msg_at DESC LIMIT 10"))
+        def active_conversations():
+            with get_db() as db:
+                return rows(db.execute(
+                    chat.CONV_SUMMARY_SQL + "WHERE c.status != 'closed' ORDER BY c.last_msg_at DESC LIMIT 10"))
+
+        items = await run_in_threadpool(active_conversations)
         if not items:
             return await say("当前没有进行中的会话")
         return await say("进行中的会话：\n" + "\n".join(_conv_line(c, a["current_conv_id"]) for c in items))
     if cmd in ("忙", "在"):
-        update_agent(online=0 if cmd == "忙" else 1)
+        if not await run_in_threadpool(update_agent, binding=binding, online=0 if cmd == "忙" else 1):
+            return
         return await say("已设为忙碌" if cmd == "忙" else "已设为在线")
 
     target = arg or a["current_conv_id"]
-    conv = chat.conv_summary(target) if target else None
+    conv = await run_in_threadpool(chat.conv_summary, target) if target else None
     if cmd in ("切换", "历史", "结束", "总结", "分类", "加标签", "普通") and not conv:
         return await say(f"会话 #{target} 不存在" if target else "请带上会话编号，例如 /历史 #12")
     if cmd == "切换":
-        update_agent(current_conv_id=conv["id"], current_set_at=0)
+        if not await run_in_threadpool(update_agent, binding=binding, current_conv_id=conv["id"], current_set_at=0):
+            return
         return await say("当前会话：" + _conv_line(conv, conv["id"]).lstrip("→"))
     if cmd in ("分类", "加标签", "普通"):
         from . import triage
         try:
             if cmd == "普通":
-                await triage.dismiss(conv['id'])
+                async with queue_lock:
+                    if not await still_bound():
+                        return
+                    await triage.dismiss(conv['id'])
                 return await say(f"#{conv['id']} 已取消高优先级")
             if cmd == "加标签":
-                item=triage.detail(conv['id'])['item']
-                if not item or item['status']!='ready':
+                async with queue_lock:
+                    if not await still_bound():
+                        return
+                    item = (await run_in_threadpool(triage.detail, conv['id']))['item']
+                    ready = item and item['status'] == 'ready'
+                    if ready:
+                        await triage.apply_tags(conv['id'], item['id'])
+                if not ready:
                     return await say('请先用 /分类 #编号 生成有效分类')
-                await triage.apply_tags(conv['id'],item['id'])
                 return await say(f"#{conv['id']} 已应用仍有效的标签建议")
             result=await triage.generate(conv['id'])
         except HTTPException as exc:
             return await say(str(exc.detail))
-        if a.get('openid') and agent()['openid']!=a['openid']:
-            return
         item=result['item']
         if item['status']!='ready':
             return await say(item['error'])
@@ -445,18 +483,18 @@ async def handle_command(content: str, a: dict):
             result = await summaries.generate(conv["id"])
         except HTTPException as exc:
             return await say(str(exc.detail))
-        if a.get("openid") and agent()["openid"] != a["openid"]:
-            return  # Binding changed while the model was running.
         item = result["item"]
         text = summaries.qq_text(item) or item["error"]
         return await say(f"#{conv['id']} " + text + ("\n生成期间有新消息，可再次发送 /总结 更新。" if result["stale"] else ""))
     if cmd == "历史":
-        msgs = chat.history(conv["id"], 10)
+        msgs = await run_in_threadpool(chat.history, conv["id"], 10)
         who = {"visitor": "访客", "agent": "客服", "system": "系统", "ai": "AI"}
         lines = [f"{m['created_at'][11:16]} {who[m['sender']]}：{m['content']}" for m in msgs]
         return await say(f"#{conv['id']} 最近消息：\n" + ("\n".join(lines) or "（无）"))
     if cmd == "结束":
-        if conv["status"] != "closed":
+        async with queue_lock:
+            if not await still_bound():
+                return
             await chat.set_conversation_status(conv["id"], "closed")
         return await say(f"#{conv['id']} 已结束")
     return await say("未知指令。\n\n" + HELP)
@@ -533,8 +571,8 @@ def _resolve_reply(d: dict, content: str, has_images: bool, inbound: dict, owner
 async def _bind_from_inbound(openid: str, msg_id: str, code: str, inbound: dict):
     from .qq_delivery import queue_lock, cancel_for_binding_change
 
-    version = None
-    async with queue_lock, _send_lock:
+    def bind():
+        version = None
         with get_db() as db:
             begin_write(db)
             owner = db.execute("SELECT * FROM qq_agent WHERE id=1").fetchone()
@@ -550,6 +588,10 @@ async def _bind_from_inbound(openid: str, msg_id: str, code: str, inbound: dict)
                 update_agent(db=db, openid=openid, bound_at=time.strftime("%Y-%m-%d %H:%M:%S"),
                              bind_code="", bind_expires=0, last_msg_id=msg_id,
                              last_msg_at=inbound["received_at"], passive_used=0)
+        return version
+
+    async with queue_lock, _send_lock:
+        version = await run_in_threadpool(bind)
     if version is None:
         await reply_to(openid, msg_id, "绑定码无效或已过期，请在 MsgHub 后台重新生成。")
     else:
@@ -566,7 +608,7 @@ async def handle_c2c(d: dict, *, inbound: dict):
     msg_id = str(d.get("id") or "")
     if not openid:
         return
-    owner = agent()
+    owner = await run_in_threadpool(agent)
     version = inbound["binding_version"]
     if owner["binding_version"] != version:
         return
@@ -578,9 +620,18 @@ async def handle_c2c(d: dict, *, inbound: dict):
         await reply_to(openid, msg_id, "这是网站客服机器人，仅供已绑定的客服使用。")
         return
 
-    received_at = inbound["received_at"]
-    if msg_id and received_at > owner["last_msg_at"] and time.time() - received_at < QQ_PASSIVE_WINDOW:
-        update_agent(last_msg_id=msg_id, last_msg_at=received_at, passive_used=0)
+    def refresh_passive_window():
+        received_at = inbound["received_at"]
+        if not msg_id or time.time() - received_at >= QQ_PASSIVE_WINDOW:
+            return False
+        with get_db() as db:
+            return db.execute(
+                "UPDATE qq_agent SET last_msg_id=?,last_msg_at=?,passive_used=0 "
+                "WHERE id=1 AND openid=? AND binding_version=? AND last_msg_at<?",
+                (msg_id, received_at, openid, version, received_at),
+            ).rowcount > 0
+
+    if await run_in_threadpool(refresh_passive_window):
         wake_backlog()
 
     async def tell(text):
@@ -600,19 +651,43 @@ async def handle_c2c(d: dict, *, inbound: dict):
         await handle_command(content, {**owner, "current_conv_id": inbound["default_conv_id"]})
         return
 
-    target, text, implicit, error = _resolve_reply(d, content, bool(images), inbound, owner)
-    if inbound["target_conv_id"] is not None:
-        target, implicit, error = inbound["target_conv_id"], bool(inbound["implicit"]), ""
+    def prepare_reply():
+        target, text, implicit, error = _resolve_reply(d, content, bool(images), inbound, agent())
+        if inbound["target_conv_id"] is not None:
+            target, implicit, error = inbound["target_conv_id"], bool(inbound["implicit"]), ""
+        if not error:
+            if chat.conv_summary(target):
+                qq_inbound.pin_reply(inbound, target, implicit)
+            else:
+                error = f"会话 #{target} 不存在"
+        return target, text, implicit, error
+
+    target, text, implicit, error = await run_in_threadpool(prepare_reply)
     if error:
         await tell(error)
         return
-    if not chat.conv_summary(target):
-        await tell(f"会话 #{target} 不存在")
-        return
-    qq_inbound.pin_reply(inbound, target, implicit)
 
     contents = []
-    messages = []
+
+    def remove_unused_images():
+        for kind, content in contents:
+            if kind == "image":
+                path = media.local_path(content)
+                if path:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        log("未使用的 QQ 图片清理失败")
+
+    def commit():
+        messages = []
+        try:
+            messages, error = qq_inbound.commit_reply(inbound, openid, target, implicit, contents)
+            return messages, error
+        finally:
+            if not messages:
+                remove_unused_images()
+
     try:
         for img in images:
             try:
@@ -629,23 +704,15 @@ async def handle_c2c(d: dict, *, inbound: dict):
                 contents.append(("image", path))
         if text:
             contents.append(("text", text))
-        messages, error = qq_inbound.commit_reply(inbound, openid, target, implicit, contents)
-    finally:
-        if not messages:
-            # A cancelled or rolled-back reply has no message referencing these new files.
-            for kind, content in contents:
-                if kind == "image":
-                    path = media.local_path(content)
-                    if path:
-                        try:
-                            path.unlink(missing_ok=True)
-                        except OSError:
-                            log("未使用的 QQ 图片清理失败")
+    except BaseException:
+        remove_unused_images()
+        raise
+    messages, error = await run_in_threadpool(commit)
     for message in messages:
-        if not chat.conv_summary(target):
+        if not await run_in_threadpool(chat.conv_summary, target):
             break
         await chat.broadcast_message(target, message)
-    if messages and chat.conv_summary(target):
+    if messages and await run_in_threadpool(chat.conv_summary, target):
         await chat.hub.to_visitor(target, {"type": "status", "status": "active"})
     if error:
         warnings.append(error)
@@ -697,9 +764,10 @@ async def callback(request: Request, callback_key: str):
         data = payload.get("d")
         if not isinstance(data, dict):
             return JSONResponse({"error": "invalid event"}, 400)
-        qq_inbound.accept(QQ_APP_ID, str(payload.get("id") or ""), data)
+        await run_in_threadpool(qq_inbound.accept, QQ_APP_ID, str(payload.get("id") or ""), data)
+        qq_inbound.wake()
     else:
-        update_agent(last_event_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        await run_in_threadpool(update_agent, last_event_at=time.strftime("%Y-%m-%d %H:%M:%S"))
     return {"op": 12}
 
 
@@ -715,20 +783,25 @@ def _mask(s: str) -> str:
 async def status():
     if not ENABLED:
         return {"enabled": False}
-    a = agent()
+    a = await run_in_threadpool(agent)
     token_ok, token_error = True, ""
     try:
         await client.token()
     except Exception as e:  # noqa: BLE001
-        token_ok, token_error = False, safe_error(e)
-    with get_db() as db:
-        pending = db.execute("SELECT COUNT(*) FROM chat_messages WHERE qq_state = 'pending'").fetchone()[0]
-        inbound_pending, inbound_failed = db.execute(
-            "SELECT COUNT(CASE WHEN status='pending' THEN 1 END),COUNT(CASE WHEN status='failed' THEN 1 END) "
-            "FROM qq_inbound WHERE status IN ('pending','failed') AND app_id=?", (QQ_APP_ID,)
-        ).fetchone()
-        priority_pending = db.execute("SELECT COUNT(*) FROM qq_deliveries WHERE kind='priority' AND status NOT IN ('sent','cancelled')").fetchone()[0]
-        handoffs_pending = db.execute("SELECT COUNT(*) FROM qq_deliveries WHERE kind='handoff' AND status NOT IN ('sent','cancelled')").fetchone()[0]
+        token_ok, token_error = False, await run_in_threadpool(safe_error, e)
+
+    def counts():
+        with get_db() as db:
+            pending = db.execute("SELECT COUNT(*) FROM chat_messages WHERE qq_state = 'pending'").fetchone()[0]
+            inbound_pending, inbound_failed = db.execute(
+                "SELECT COUNT(CASE WHEN status='pending' THEN 1 END),COUNT(CASE WHEN status='failed' THEN 1 END) "
+                "FROM qq_inbound WHERE status IN ('pending','failed') AND app_id=?", (QQ_APP_ID,)
+            ).fetchone()
+            priority_pending = db.execute("SELECT COUNT(*) FROM qq_deliveries WHERE kind='priority' AND status NOT IN ('sent','cancelled')").fetchone()[0]
+            handoffs_pending = db.execute("SELECT COUNT(*) FROM qq_deliveries WHERE kind='handoff' AND status NOT IN ('sent','cancelled')").fetchone()[0]
+        return pending, inbound_pending, inbound_failed, priority_pending, handoffs_pending
+
+    pending, inbound_pending, inbound_failed, priority_pending, handoffs_pending = await run_in_threadpool(counts)
     window = max(0, int(QQ_PASSIVE_WINDOW - (time.time() - a["last_msg_at"]))) if passive_available(a) else 0
     return {
         "enabled": True,
@@ -765,13 +838,17 @@ def bind_code():
 @router.post("/api/admin/qq/unbind", tags=["QQ"], dependencies=[admin])
 async def unbind():
     from .qq_delivery import queue_lock, cancel_for_binding_change
-    async with queue_lock, _send_lock:
+
+    def clear_binding():
         with get_db() as db:
             begin_write(db)
             version = db.execute("SELECT binding_version FROM qq_agent WHERE id=1").fetchone()[0]
             update_agent(db=db, openid="", bound_at=None, last_msg_id="", last_msg_at=0, passive_used=0,
                          current_conv_id=None, current_set_at=0, binding_version=version + 1, bind_code="", bind_expires=0)
             cancel_for_binding_change(db=db)
+
+    async with queue_lock, _send_lock:
+        await run_in_threadpool(clear_binding)
     return {"ok": True}
 
 

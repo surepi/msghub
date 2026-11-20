@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Path as PathParam, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 
 from . import auth
@@ -163,17 +164,21 @@ async def visitor_upload(request: Request, file: UploadFile, site_key: str = For
     ip = request.client.host if request.client else ""
     if not _upload_by_ip.allow(ip):
         return reply(429, {"error": "上传过于频繁，请稍后再试"})
-    with get_db() as db:
-        site = db.execute("SELECT * FROM sites WHERE site_key = ?", (site_key,)).fetchone()
-        visitor = db.execute("SELECT id FROM visitors WHERE token = ? AND site_id = ?",
-                             (token, site["id"] if site else None)).fetchone()
+    def upload_owner():
+        with get_db() as db:
+            site = db.execute("SELECT * FROM sites WHERE site_key = ?", (site_key,)).fetchone()
+            visitor = db.execute("SELECT id FROM visitors WHERE token = ? AND site_id = ?",
+                                 (token, site["id"] if site else None)).fetchone()
+        return site, visitor
+
+    site, visitor = await run_in_threadpool(upload_owner)
     if not site or not site["enabled"] or not origin_allowed(dict(site), origin, request.headers):
         return reply(403, {"error": "站点不存在或来源不被允许"})
     if not visitor:
         return reply(403, {"error": "请先开始对话"})
     data = await file.read(MAX_IMAGE_BYTES + 1)
     try:
-        return reply(200, {"url": stage_image(data, f"visitor:{visitor['id']}")})
+        return reply(200, {"url": await run_in_threadpool(stage_image, data, f"visitor:{visitor['id']}")})
     except ValueError as e:
         return reply(400, {"error": str(e)})
 
@@ -181,6 +186,6 @@ async def visitor_upload(request: Request, file: UploadFile, site_key: str = For
 @router.post("/api/admin/upload", tags=["对话"])
 async def admin_upload(file: UploadFile, token: str = Depends(auth.require_admin)):
     try:
-        return {"url": stage_image(await _read_limited(file), admin_owner(token))}
+        return {"url": await run_in_threadpool(stage_image, await _read_limited(file), admin_owner(token))}
     except ValueError as e:
         raise HTTPException(400, str(e))

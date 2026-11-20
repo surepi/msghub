@@ -27,12 +27,14 @@ import asyncio
 import secrets
 import sqlite3
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import date
 from typing import Awaitable, Callable, Literal
+from weakref import WeakValueDictionary
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from . import auth, media
@@ -69,6 +71,13 @@ class Hub:
         self.visitors: dict[int, set[WebSocket]] = defaultdict(set)  # 会话 ID -> 访客连接（可能多个标签页）
         self.visitor_connections: dict[WebSocket, VisitorConnection] = {}
         self.admins: dict[WebSocket, str] = {}
+        self._site_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
+
+    def site_lock(self, site_id: int) -> asyncio.Lock:
+        lock = self._site_locks.get(site_id)
+        if lock is None:
+            lock = self._site_locks[site_id] = asyncio.Lock()
+        return lock
 
     @staticmethod
     async def _send(ws: WebSocket, data: dict) -> bool:
@@ -89,8 +98,13 @@ class Hub:
         return sent
 
     async def send_visitor(self, ws: WebSocket, data: dict) -> bool:
-        if ws not in self.visitor_connections:
+        connection = self.visitor_connections.get(ws)
+        if not connection:
             return False
+        # A site edit may have committed in a worker before its sockets are revoked here.
+        async with self.site_lock(connection.site_id):
+            if ws not in self.visitor_connections:
+                return False
         sent = await self._send(ws, data)
         return sent and ws in self.visitor_connections
 
@@ -234,8 +248,8 @@ def find_site(site_key: str) -> dict | None:
     return dict(r) if r else None
 
 
-def get_site(site_id: int) -> dict | None:
-    with get_db() as db:
+def get_site(site_id: int, *, db=None) -> dict | None:
+    with (get_db() if db is None else nullcontext(db)) as db:
         r = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
     return dict(r) if r else None
 
@@ -250,9 +264,9 @@ def find_visitor(site_id: int, token: str) -> dict | None:
     return dict(r) if r else None
 
 
-def create_visitor(site_id: int, ip: str, ua: str, page: str) -> dict:
+def create_visitor(site_id: int, ip: str, ua: str, page: str, *, db=None) -> dict:
     token = "v_" + secrets.token_urlsafe(24)
-    with get_db() as db:
+    with (get_db() if db is None else nullcontext(db)) as db:
         cur = db.execute(
             "INSERT INTO visitors (token, site_id, ip, user_agent, first_page) VALUES (?,?,?,?,?)",
             (token, site_id, ip, ua[:300], page[:500]),
@@ -268,8 +282,8 @@ def find_conversation(site_id: int, visitor_id: int) -> dict | None:
     return dict(r) if r else None
 
 
-def get_or_create_conversation(site_id: int, visitor_id: int) -> dict:
-    with get_db() as db:
+def get_or_create_conversation(site_id: int, visitor_id: int, *, db=None) -> dict:
+    with (get_db() if db is None else nullcontext(db)) as db:
         insert_once(
             db, "INSERT INTO conversations (site_id, visitor_id) VALUES (?, ?)", (site_id, visitor_id)
         )
@@ -327,14 +341,14 @@ def add_message(conv_id: int, sender: str, content: str, page_url: str = "", msg
 async def broadcast_message(conv_id: int, msg: dict, client_id: str = ""):
     """把一条新消息推给访客和所有在线的客服后台。"""
     await hub.to_visitor(conv_id, {"type": "msg", "message": msg, "client_id": client_id})
-    if summary := conv_summary(conv_id):
+    if summary := await run_in_threadpool(conv_summary, conv_id):
         await hub.to_admins({"type": "msg", "conversation": summary, "message": msg})
 
 
 async def agent_reply(conv_id: int, content: str, msg_type: str = "text", *,
                       upload_owner: str | None = None) -> tuple[dict, bool]:
     """客服回复（网页后台和 QQ 共用）。返回 (消息, 访客当前是否在线)。"""
-    msg = add_message(conv_id, "agent", content, msg_type=msg_type, upload_owner=upload_owner)
+    msg = await run_in_threadpool(add_message, conv_id, "agent", content, msg_type=msg_type, upload_owner=upload_owner)
     delivered = hub.visitor_online(conv_id)
     await broadcast_message(conv_id, msg)
     await hub.to_visitor(conv_id, {"type": "status", "status": "active"})
@@ -343,27 +357,40 @@ async def agent_reply(conv_id: int, content: str, msg_type: str = "text", *,
 
 async def post_message(conv_id: int, sender: str, content: str) -> dict:
     """AI / 系统消息。"""
-    msg = add_message(conv_id, sender, content)
+    msg = await run_in_threadpool(add_message, conv_id, sender, content)
     await broadcast_message(conv_id, msg)
     return msg
 
 
 async def set_conversation_status(conv_id: int, status: str):
     """结束（closed）或重新打开（waiting）会话，并通知访客与后台。"""
-    with get_db() as db:
-        if status == "closed":
-            db.execute(
-                f"UPDATE conversations SET status='closed', closed_at={NOW_SQL}, ai_waiting_for_agent=0, "
-                f"auto_handled_upto={GREATEST_SQL}(auto_handled_upto, COALESCE((SELECT MAX(id) FROM chat_messages "
-                "WHERE conversation_id=? AND sender='visitor'),0)) WHERE id=?",
-                (conv_id, conv_id),
-            )
-        else:
+    def update():
+        with get_db() as db:
+            begin_write(db)
+            current = db.execute("SELECT status FROM conversations WHERE id=?", (conv_id,)).fetchone()
+            if not current:
+                raise HTTPException(404, "会话不存在")
+            if current[0] == status:
+                return False, None
+            if status == "closed":
+                db.execute(
+                    f"UPDATE conversations SET status='closed', closed_at={NOW_SQL}, ai_waiting_for_agent=0, "
+                    f"auto_handled_upto={GREATEST_SQL}(auto_handled_upto, COALESCE((SELECT MAX(id) FROM chat_messages "
+                    "WHERE conversation_id=? AND sender='visitor'),0)) WHERE id=?",
+                    (conv_id, conv_id),
+                )
+                return True, add_message(conv_id, "system", CONVERSATION_CLOSED_TEXT, db=db)
             db.execute("UPDATE conversations SET status = 'waiting', closed_at = NULL, ai_waiting_for_agent=0 WHERE id = ?", (conv_id,))
-    if status == "closed":
-        await post_message(conv_id, "system", CONVERSATION_CLOSED_TEXT)
-    await hub.to_visitor(conv_id, {"type": "status", "status": status})
-    await hub.to_admins({"type": "conv", "conversation": conv_summary(conv_id)})
+            return True, None
+
+    changed, message = await run_in_threadpool(update)
+    if not changed:
+        return
+    if message:
+        await broadcast_message(conv_id, message)
+    if summary := await run_in_threadpool(conv_summary, conv_id):
+        await hub.to_visitor(conv_id, {"type": "status", "status": summary["status"]})
+        await hub.to_admins({"type": "conv", "conversation": summary})
 
 
 def _profile(visitor: dict | None) -> dict | None:
@@ -380,6 +407,22 @@ def _profile_complete(visitor: dict | None) -> bool:
 # 访客 WebSocket
 # ---------------------------------------------------------------------------
 
+def _authorized_site(site, site_key, headers):
+    if not site or not site["enabled"] or site["site_key"] != site_key:
+        raise HTTPException(403, "站点不存在或已停用")
+    if not origin_allowed(site, headers.get("origin", ""), headers):
+        raise HTTPException(403, "来源域名不被允许")
+    return site
+
+
+@contextmanager
+def _visitor_write(site, headers):
+    with get_db() as db:
+        begin_write(db)
+        current = _authorized_site(get_site(site["id"], db=db), site["site_key"], headers)
+        yield db, current
+
+
 @router.websocket("/api/chat/ws")
 async def visitor_ws(ws: WebSocket):
     from . import qq
@@ -392,24 +435,37 @@ async def visitor_ws(ws: WebSocket):
 
     try:
         hello = await asyncio.wait_for(ws.receive_json(), HELLO_TIMEOUT)
+    except WebSocketDisconnect:
+        return
     except Exception:
         return await fail("握手超时")
     if not isinstance(hello, dict) or hello.get("type") != "hello":
         return await fail("协议错误")
 
-    site = find_site(str(hello.get("site_key", "")))
-    if not site or not site["enabled"]:
+    site_key = str(hello.get("site_key", ""))
+    site = await run_in_threadpool(find_site, site_key)
+    if not site:
         return await fail("站点不存在或已停用", 4403)
-    if not origin_allowed(site, ws.headers.get("origin", ""), ws.headers):
-        return await fail("来源域名不被允许", 4403)
 
     ip = ws.client.host if ws.client else ""
     ua = ws.headers.get("user-agent", "")
     page_url = str(hello.get("page_url", ""))[:500]
+    headers = ws.headers
 
-    # 访客身份在填写资料或第一次发消息时才创建，只打开挂件不会产生数据
-    visitor = find_visitor(site["id"], str(hello.get("token", "")))
-    conv = find_conversation(site["id"], visitor["id"]) if visitor else None
+    def restore_session():
+        current = _authorized_site(get_site(site["id"]), site_key, headers)
+        existing = find_visitor(current["id"], str(hello.get("token", "")))
+        conversation = find_conversation(current["id"], existing["id"]) if existing else None
+        return current, existing, conversation
+
+    try:
+        async with hub.site_lock(site["id"]):
+            site, visitor, conv = await run_in_threadpool(restore_session)
+            hub.track_visitor(ws, site)
+            if conv:
+                hub.join(conv["id"], ws)
+    except HTTPException as error:
+        return await fail(error.detail, 4403)
 
     async def send(data: dict) -> bool:
         return await hub.send_visitor(ws, data)
@@ -421,23 +477,27 @@ async def visitor_ws(ws: WebSocket):
         if not _new_visitor_by_ip.allow(ip):
             await send({"type": "error", "error": "操作过于频繁，请稍后再试", "client_id": client_id})
             return False
-        visitor = create_visitor(site["id"], ip, ua, page_url)
+        def register():
+            with _visitor_write(site, headers) as (db, _):
+                return create_visitor(site["id"], ip, ua, page_url, db=db)
+
+        visitor = await run_in_threadpool(register)
         return await send({"type": "token", "token": visitor["token"]})
 
-    hub.track_visitor(ws, site)
     try:
-        if conv:
-            hub.join(conv["id"], ws)
-            await hub.to_admins({"type": "conv", "conversation": conv_summary(conv["id"])})
+        if conv and (summary := await run_in_threadpool(conv_summary, conv["id"])):
+            await hub.to_admins({"type": "conv", "conversation": summary})
         if ws not in hub.visitor_connections:
             return
+        config = await run_in_threadpool(site_public_config, site)
+        messages = await run_in_threadpool(history, conv["id"]) if conv else []
         if not await send({
             "type": "init",
-            "site": site_public_config(site),
+            "site": config,
             "profile": _profile(visitor),
             "conversation": {"id": conv["id"], "status": conv["status"]} if conv else None,
             "ai_handoff": bool(conv and conv["ai_waiting_for_agent"]),
-            "messages": history(conv["id"]) if conv else [],
+            "messages": messages,
         }):
             return
 
@@ -452,12 +512,10 @@ async def visitor_ws(ws: WebSocket):
                 await send({"type": "pong"})
                 continue
 
-            current = get_site(site["id"])
-            if (not current or not current["enabled"] or current["site_key"] != site["site_key"]
-                    or not origin_allowed(current, ws.headers.get("origin", ""), ws.headers)):
-                hub.leave(ws)
-                return await fail("站点不存在或已停用", 4403)
-            site = current
+            current = await run_in_threadpool(get_site, site["id"])
+            if ws not in hub.visitor_connections:
+                return
+            site = _authorized_site(current, site_key, headers)
 
             if kind == "profile":
                 name = str(data.get("name", "")).strip()[:MAX_NAME]
@@ -470,11 +528,14 @@ async def visitor_ws(ws: WebSocket):
                     continue
                 if not await ensure_visitor():
                     continue
-                with get_db() as db:
-                    db.execute("UPDATE visitors SET name = ?, contact = ? WHERE id = ?", (name, contact, visitor["id"]))
+                def update_profile():
+                    with _visitor_write(site, headers) as (db, _):
+                        db.execute("UPDATE visitors SET name = ?, contact = ? WHERE id = ?", (name, contact, visitor["id"]))
+
+                await run_in_threadpool(update_profile)
                 visitor = {**visitor, "name": name, "contact": contact}
                 await send({"type": "profile_ok", "profile": _profile(visitor)})
-                if conv and (summary := conv_summary(conv["id"])):
+                if conv and (summary := await run_in_threadpool(conv_summary, conv["id"])):
                     await hub.to_admins({"type": "conv", "conversation": summary})
                 continue
 
@@ -501,36 +562,56 @@ async def visitor_ws(ws: WebSocket):
                 continue
             if not await ensure_visitor(client_id):
                 continue
-            if not conv:
-                conv = get_or_create_conversation(site["id"], visitor["id"])
-                hub.join(conv["id"], ws)
-
             msg_page = str(data.get("page_url", ""))[:500] or page_url
-            was_closed = conv_summary(conv["id"])["status"] == "closed"
             owner = f"visitor:{visitor['id']}" if msg_type == "image" else None
+
+            def save_message():
+                with _visitor_write(site, headers) as (db, fresh):
+                    if fresh["require_contact"] and not _profile_complete(visitor):
+                        raise HTTPException(409, "请先填写称呼和联系方式")
+                    target = conv or get_or_create_conversation(site["id"], visitor["id"], db=db)
+                    status = db.execute("SELECT status FROM conversations WHERE id=?", (target["id"],)).fetchone()
+                    if not status:
+                        raise HTTPException(404, "对话不存在")
+                    message = add_message(target["id"], "visitor", content, msg_page, msg_type, db=db,
+                                          queue_qq=qq.ENABLED, upload_owner=owner)
+                    return target, status[0] == "closed", message
+
             try:
-                msg = add_message(conv["id"], "visitor", content, msg_page, msg_type, queue_qq=qq.ENABLED,
-                                  upload_owner=owner)
+                target, was_closed, msg = await run_in_threadpool(save_message)
             except HTTPException as error:
-                await send({"type": "error", "error": error.detail, "client_id": client_id})
+                if error.status_code == 403:
+                    raise
+                await send({"type": "error", "error": error.detail, "client_id": client_id,
+                            "need_profile": error.status_code == 409})
                 continue
+            if not conv:
+                conv = target
+                if ws in hub.visitor_connections:
+                    hub.join(conv["id"], ws)
             await broadcast_message(conv["id"], msg, client_id)
             if was_closed:
                 await hub.to_visitor(conv["id"], {"type": "status", "status": "waiting"})
 
-            summary = conv_summary(conv["id"])
+            summary = await run_in_threadpool(conv_summary, conv["id"])
+            if not summary:
+                continue
             for hook in visitor_message_hooks:
                 try:
                     await hook(summary, msg)
                 except Exception as e:  # noqa: BLE001
                     print(f"[chat] hook 执行失败: {e!r}", flush=True)
+    except HTTPException as error:
+        if ws in hub.visitor_connections:
+            hub.leave(ws)
+            await fail(error.detail, 4403)
     except (WebSocketDisconnect, RuntimeError):
         pass
     except Exception as e:  # noqa: BLE001  无效 JSON 等
         print(f"[chat] 访客连接异常: {e!r}", flush=True)
     finally:
         hub.leave(ws)
-        if conv and (summary := conv_summary(conv["id"])):
+        if conv and (summary := await run_in_threadpool(conv_summary, conv["id"])):
             await hub.to_admins({"type": "conv", "conversation": summary})
 
 
@@ -742,35 +823,45 @@ def list_tags():
 
 @router.post("/api/admin/tags", tags=["标签"], dependencies=[admin])
 async def create_tag(body: TagIn):
-    name = _tag_name(body)
-    try:
-        with get_db() as db:
-            cur = db.execute("INSERT INTO tags (name) VALUES (?)", (name,))
-            tag = {"id": cur.lastrowid, "name": name, "conversation_count": 0}
-    except (sqlite3.IntegrityError, DuplicateKeyError):
-        raise HTTPException(409, "已存在同名标签")
+    def insert():
+        name = _tag_name(body)
+        try:
+            with get_db() as db:
+                cur = db.execute("INSERT INTO tags (name) VALUES (?)", (name,))
+                tag = {"id": cur.lastrowid, "name": name, "conversation_count": 0}
+        except (sqlite3.IntegrityError, DuplicateKeyError):
+            raise HTTPException(409, "已存在同名标签")
+        return tag
+
+    tag = await run_in_threadpool(insert)
     await hub.to_admins({"type": "tags_changed"})
     return tag
 
 
 @router.put("/api/admin/tags/{tag_id}", tags=["标签"], dependencies=[admin])
 async def rename_tag(tag_id: int, body: TagIn):
-    name = _tag_name(body)
-    try:
-        with get_db() as db:
-            if not db.execute("UPDATE tags SET name = ? WHERE id = ?", (name, tag_id)).rowcount:
-                raise HTTPException(404, "标签不存在")
-    except (sqlite3.IntegrityError, DuplicateKeyError):
-        raise HTTPException(409, "已存在同名标签")
+    def rename():
+        name = _tag_name(body)
+        try:
+            with get_db() as db:
+                if not db.execute("UPDATE tags SET name = ? WHERE id = ?", (name, tag_id)).rowcount:
+                    raise HTTPException(404, "标签不存在")
+        except (sqlite3.IntegrityError, DuplicateKeyError):
+            raise HTTPException(409, "已存在同名标签")
+
+    await run_in_threadpool(rename)
     await hub.to_admins({"type": "tags_changed"})
     return {"ok": True}
 
 
 @router.delete("/api/admin/tags/{tag_id}", tags=["标签"], dependencies=[admin])
 async def delete_tag(tag_id: int):
-    with get_db() as db:
-        if not db.execute("DELETE FROM tags WHERE id = ?", (tag_id,)).rowcount:
-            raise HTTPException(404, "标签不存在")
+    def delete():
+        with get_db() as db:
+            if not db.execute("DELETE FROM tags WHERE id = ?", (tag_id,)).rowcount:
+                raise HTTPException(404, "标签不存在")
+
+    await run_in_threadpool(delete)
     await hub.to_admins({"type": "tags_changed"})
     return {"ok": True}
 
@@ -783,26 +874,31 @@ class TagBatchIn(BaseModel):
 
 async def _change_tags(conv_ids: list[int], tag_id: int, action: str) -> list[dict]:
     conv_ids = list(dict.fromkeys(conv_ids))
-    marks = ",".join("?" for _ in conv_ids)
-    with get_db() as db:
-        # Validate and mutate in one transaction; invalid batches must change nothing.
-        begin_write(db)
-        if not db.execute("SELECT 1 FROM tags WHERE id = ?", (tag_id,)).fetchone():
-            raise HTTPException(404, "标签不存在")
-        count = db.execute(f"SELECT COUNT(*) FROM conversations WHERE id IN ({marks})", conv_ids).fetchone()[0]
-        if count != len(conv_ids):
-            raise HTTPException(404, "部分会话已不存在，请刷新后重试")
-        if action == "add":
-            db.executemany("DELETE FROM conversation_ai_tag_blocks WHERE conversation_id=? AND tag_id=?", [(cid,tag_id) for cid in conv_ids])
-            for cid in conv_ids:
-                insert_once(db, "INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (?, ?)", (cid, tag_id))
-        else:
-            for cid in conv_ids:
-                insert_once(db, "INSERT INTO conversation_ai_tag_blocks (conversation_id, tag_id) VALUES (?, ?)", (cid, tag_id))
-            db.executemany("DELETE FROM conversation_tags WHERE conversation_id = ? AND tag_id = ?",
-                           [(cid, tag_id) for cid in conv_ids])
-        conversations = rows(db.execute(CONV_SUMMARY_SQL + f"WHERE c.id IN ({marks})", conv_ids))
-        _attach_tags(db, conversations)
+
+    def mutate():
+        marks = ",".join("?" for _ in conv_ids)
+        with get_db() as db:
+            # Validate and mutate in one transaction; invalid batches must change nothing.
+            begin_write(db)
+            if not db.execute("SELECT 1 FROM tags WHERE id = ?", (tag_id,)).fetchone():
+                raise HTTPException(404, "标签不存在")
+            count = db.execute(f"SELECT COUNT(*) FROM conversations WHERE id IN ({marks})", conv_ids).fetchone()[0]
+            if count != len(conv_ids):
+                raise HTTPException(404, "部分会话已不存在，请刷新后重试")
+            if action == "add":
+                db.executemany("DELETE FROM conversation_ai_tag_blocks WHERE conversation_id=? AND tag_id=?", [(cid,tag_id) for cid in conv_ids])
+                for cid in conv_ids:
+                    insert_once(db, "INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (?, ?)", (cid, tag_id))
+            else:
+                for cid in conv_ids:
+                    insert_once(db, "INSERT INTO conversation_ai_tag_blocks (conversation_id, tag_id) VALUES (?, ?)", (cid, tag_id))
+                db.executemany("DELETE FROM conversation_tags WHERE conversation_id = ? AND tag_id = ?",
+                               [(cid, tag_id) for cid in conv_ids])
+            conversations = rows(db.execute(CONV_SUMMARY_SQL + f"WHERE c.id IN ({marks})", conv_ids))
+            _attach_tags(db, conversations)
+        return conversations
+
+    conversations = await run_in_threadpool(mutate)
     for c in conversations:
         c["visitor_online"] = hub.visitor_online(c["id"])
         await hub.to_admins({"type": "conv", "conversation": c})
@@ -831,19 +927,21 @@ async def remove_tag_from_conversation(conv_id: int, tag_id: int):
 
 
 @router.get("/api/admin/conversations/{conv_id}", tags=["对话"], dependencies=[admin])
-async def get_conversation(conv_id: int, message_id: int | None = Query(default=None, gt=0)):
+def get_conversation(conv_id: int, message_id: int | None = Query(default=None, gt=0)):
     conv = _require_conv(conv_id)
     with get_db() as db:
         window = _message_page(db, conv_id, around_id=message_id, limit=100 if message_id else 500)
-        visitor = dict(db.execute(
+        visitor = db.execute(
             "SELECT id, name, contact, ip, user_agent, first_page, created_at, last_seen_at FROM visitors WHERE id = ?",
             (conv["visitor_id"],),
-        ).fetchone())
+        ).fetchone()
+        if visitor is None:
+            raise HTTPException(404, "会话不存在")
         notes = rows(db.execute(
             "SELECT id, content, created_at FROM conversation_notes WHERE conversation_id = ? ORDER BY id DESC LIMIT 100",
             (conv_id,),
         ))
-    return {"conversation": conv, "visitor": visitor, "messages": window["items"], "notes": notes,
+    return {"conversation": conv, "visitor": dict(visitor), "messages": window["items"], "notes": notes,
             "has_older": window["has_older"], "has_newer": window["has_newer"]}
 
 
@@ -952,17 +1050,21 @@ class ReadIn(BaseModel):
 @router.post("/api/admin/conversations/{conv_id}/read", tags=["对话"], dependencies=[admin])
 async def mark_read(conv_id: int, body: ReadIn):
     upto = body.upto_id
-    with get_db() as db:
-        begin_write(db)
-        if not db.execute("SELECT 1 FROM chat_messages WHERE conversation_id = ? AND id = ?", (conv_id, upto)).fetchone():
-            raise HTTPException(404, "消息不存在或不属于此会话")
-        changed = db.execute(
-            "UPDATE conversations SET read_upto = ?, unread = ("
-            "SELECT COUNT(*) FROM chat_messages WHERE conversation_id = ? AND sender = 'visitor' AND id > ?"
-            ") WHERE id = ? AND read_upto < ?",
-            (upto, conv_id, upto, conv_id, upto),
-        ).rowcount
-    if changed and (summary := conv_summary(conv_id)):
+
+    def advance():
+        with get_db() as db:
+            begin_write(db)
+            if not db.execute("SELECT 1 FROM chat_messages WHERE conversation_id = ? AND id = ?", (conv_id, upto)).fetchone():
+                raise HTTPException(404, "消息不存在或不属于此会话")
+            changed = db.execute(
+                "UPDATE conversations SET read_upto = ?, unread = ("
+                "SELECT COUNT(*) FROM chat_messages WHERE conversation_id = ? AND sender = 'visitor' AND id > ?"
+                ") WHERE id = ? AND read_upto < ?",
+                (upto, conv_id, upto, conv_id, upto),
+            ).rowcount
+        return conv_summary(conv_id) if changed else None
+
+    if summary := await run_in_threadpool(advance):
         await hub.to_admins({"type": "conv", "conversation": summary})
     return {"ok": True}
 
@@ -974,7 +1076,7 @@ class ReplyIn(BaseModel):
 
 @router.post("/api/admin/conversations/{conv_id}/messages", tags=["对话"])
 async def reply(conv_id: int, body: ReplyIn, token: str = admin):
-    _require_conv(conv_id)
+    await run_in_threadpool(_require_conv, conv_id)
     content = body.content.strip()
     msg_type = "image" if body.msg_type == "image" else "text"
     if not content:
@@ -994,18 +1096,19 @@ class StatusIn(BaseModel):
 
 @router.post("/api/admin/conversations/{conv_id}/status", tags=["对话"], dependencies=[admin])
 async def set_status(conv_id: int, body: StatusIn):
-    conv = _require_conv(conv_id)
     if body.status not in ("closed", "waiting"):
         raise HTTPException(400, "状态无效")
-    if conv["status"] != body.status:
-        await set_conversation_status(conv_id, body.status)
+    await set_conversation_status(conv_id, body.status)
     return {"ok": True}
 
 
 @router.delete("/api/admin/conversations/{conv_id}", tags=["对话"], dependencies=[admin])
 async def delete_conversation(conv_id: int):
-    with get_db() as db:
-        db.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+    def delete():
+        with get_db() as db:
+            db.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+
+    await run_in_threadpool(delete)
     await hub.close_visitors(list(hub.visitors.get(conv_id, ())), 4410)
     await hub.to_admins({"type": "conv_deleted", "id": conv_id})
     return {"ok": True}

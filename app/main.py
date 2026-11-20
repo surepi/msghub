@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -16,7 +17,7 @@ from pydantic import BaseModel, Field
 from . import auth, auto, chat, media, qq, qq_delivery, summaries, triage
 from .common import RateLimiter, http_origin, origin_allowed, parse_work_hours
 from .config import MAX_CONTACT, MAX_CONTENT, MAX_NAME, RATE_LIMIT_PER_MIN
-from .db import ADMIN_MESSAGE_SQL, NOW_SQL, STATUSES, get_db, init_db, rows, since
+from .db import ADMIN_MESSAGE_SQL, NOW_SQL, STATUSES, begin_write, get_db, init_db, rows, since
 from .ingress import IngressLimits
 from .outbound import open_outbound
 
@@ -201,11 +202,9 @@ async def public_submit(request: Request, bg: BackgroundTasks):
     if not site_key:
         return fail(400, "缺少 site_key")
 
-    with get_db() as db:
-        site = db.execute("SELECT * FROM sites WHERE site_key = ?", (site_key,)).fetchone()
+    site = await run_in_threadpool(chat.find_site, site_key)
     if not site or not site["enabled"]:
         return fail(403, "站点不存在或已停用")
-    site = dict(site)
     if not origin_allowed(site, origin, request.headers):
         return fail(403, "来源域名不被允许")
 
@@ -232,13 +231,19 @@ async def public_submit(request: Request, bg: BackgroundTasks):
         "ip": ip,
         "user_agent": request.headers.get("user-agent", "")[:300],
     }
-    with get_db() as db:
-        cur = db.execute(
-            "INSERT INTO messages (site_id,name,contact,content,page_url,ip,user_agent) "
-            "VALUES (?,?,?,?,?,?,?)",
-            tuple(msg[key] for key in ("site_id", "name", "contact", "content", "page_url", "ip", "user_agent")),
-        )
-        msg["id"] = cur.lastrowid
+    def save_message():
+        with get_db() as db:
+            cur = db.execute(
+                "INSERT INTO messages (site_id,name,contact,content,page_url,ip,user_agent) "
+                "SELECT id,?,?,?,?,?,? FROM sites WHERE id=? AND site_key=? AND enabled=1 AND allowed_origins=?",
+                (*(msg[key] for key in ("name", "contact", "content", "page_url", "ip", "user_agent")),
+                 site["id"], site_key, site["allowed_origins"]),
+            )
+            return cur.lastrowid if cur.rowcount else None
+
+    msg["id"] = await run_in_threadpool(save_message)
+    if msg["id"] is None:
+        return fail(403, "站点设置已变更，请重试")
 
     await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": []})
 
@@ -365,34 +370,48 @@ def create_site(body: SiteIn):
 @app.put("/api/admin/sites/{site_id}", tags=["站点"], dependencies=[admin])
 async def update_site(site_id: int, body: SiteIn):
     values = _site_values(body)
-    with get_db() as db:
-        cur = db.execute(
-            f"UPDATE sites SET {', '.join(f + '=?' for f in SITE_FIELDS)} WHERE id=?",
-            [*values, site_id],
-        )
-        if not cur.rowcount:
-            raise HTTPException(404, "站点不存在")
-        site = dict(db.execute("SELECT site_key, enabled, allowed_origins FROM sites WHERE id=?",
-                               (site_id,)).fetchone())
-    await chat.hub.revoke_site_visitors(site_id, site)
+
+    def save_site():
+        with get_db() as db:
+            cur = db.execute(
+                f"UPDATE sites SET {', '.join(f + '=?' for f in SITE_FIELDS)} WHERE id=?",
+                [*values, site_id],
+            )
+            if not cur.rowcount:
+                raise HTTPException(404, "站点不存在")
+            return dict(db.execute("SELECT site_key, enabled, allowed_origins FROM sites WHERE id=?",
+                                   (site_id,)).fetchone())
+
+    async with chat.hub.site_lock(site_id):
+        site = await run_in_threadpool(save_site)
+        await chat.hub.revoke_site_visitors(site_id, site)
     return {"ok": True}
 
 
 @app.post("/api/admin/sites/{site_id}/rotate-key", tags=["站点"], dependencies=[admin])
 async def rotate_key(site_id: int):
     key = "sk_" + secrets.token_urlsafe(24)
-    with get_db() as db:
-        if not db.execute("UPDATE sites SET site_key=? WHERE id=?", (key, site_id)).rowcount:
-            raise HTTPException(404, "站点不存在")
-    await chat.hub.revoke_site_visitors(site_id)
+
+    def save_key():
+        with get_db() as db:
+            if not db.execute("UPDATE sites SET site_key=? WHERE id=?", (key, site_id)).rowcount:
+                raise HTTPException(404, "站点不存在")
+
+    async with chat.hub.site_lock(site_id):
+        await run_in_threadpool(save_key)
+        await chat.hub.revoke_site_visitors(site_id)
     return {"site_key": key}
 
 
 @app.delete("/api/admin/sites/{site_id}", tags=["站点"], dependencies=[admin])
 async def delete_site(site_id: int):
-    with get_db() as db:
-        db.execute("DELETE FROM sites WHERE id=?", (site_id,))
-    await chat.hub.revoke_site_visitors(site_id)
+    def remove_site():
+        with get_db() as db:
+            db.execute("DELETE FROM sites WHERE id=?", (site_id,))
+
+    async with chat.hub.site_lock(site_id):
+        await run_in_threadpool(remove_site)
+        await chat.hub.revoke_site_visitors(site_id)
     return {"ok": True}
 
 
@@ -439,14 +458,19 @@ class MsgPatch(BaseModel):
 
 @app.post("/api/admin/messages/{msg_id}/read", tags=["留言"], dependencies=[admin])
 async def mark_message_read(msg_id: int):
-    with get_db() as db:
-        message = db.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
-        if not message:
-            raise HTTPException(404, "留言不存在")
-        changed = db.execute(f"UPDATE messages SET status = 'read', updated_at = {NOW_SQL} WHERE id = ? AND status = 'new'", (msg_id,)).rowcount
-        current = db.execute("SELECT status FROM messages WHERE id = ?", (msg_id,)).fetchone()[0]
+    def mark():
+        with get_db() as db:
+            begin_write(db)
+            message = db.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
+            if not message:
+                raise HTTPException(404, "留言不存在")
+            changed = db.execute(f"UPDATE messages SET status = 'read', updated_at = {NOW_SQL} WHERE id = ? AND status = 'new'", (msg_id,)).rowcount
+            current = db.execute("SELECT status FROM messages WHERE id = ?", (msg_id,)).fetchone()[0]
+        return message[0], changed, current
+
+    conversation_id, changed, current = await run_in_threadpool(mark)
     if changed:
-        await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": [message[0]] if message[0] else []})
+        await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": [conversation_id] if conversation_id else []})
     return {"ok": True, "status": current}
 
 
@@ -462,11 +486,14 @@ async def patch_message(msg_id: int, body: MsgPatch):
     if not sets:
         return {"ok": True}
     sets.append(f"updated_at={NOW_SQL}")
-    with get_db() as db:
-        source = db.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
-        if not db.execute(f"UPDATE messages SET {', '.join(sets)} WHERE id=?", [*args, msg_id]).rowcount:
-            raise HTTPException(404, "留言不存在")
-    await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": [source[0]] if source[0] else []})
+    def update():
+        with get_db() as db:
+            if not db.execute(f"UPDATE messages SET {', '.join(sets)} WHERE id=?", [*args, msg_id]).rowcount:
+                raise HTTPException(404, "留言不存在")
+            return db.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()[0]
+
+    conversation_id = await run_in_threadpool(update)
+    await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": [conversation_id] if conversation_id else []})
     return {"ok": True}
 
 
@@ -480,26 +507,36 @@ async def batch_messages(body: BatchIn):
     if not body.ids:
         return {"ok": True, "affected": 0}
     marks = ",".join("?" * len(body.ids))
-    with get_db() as db:
-        source_ids = [r[0] for r in db.execute(f"SELECT DISTINCT conversation_id FROM messages WHERE id IN ({marks}) AND conversation_id IS NOT NULL", body.ids)]
-        if body.action == "delete":
-            n = db.execute(f"DELETE FROM messages WHERE id IN ({marks})", body.ids).rowcount
-        elif body.action in STATUSES:
-            n = db.execute(
-                f"UPDATE messages SET status=?, updated_at={NOW_SQL} WHERE id IN ({marks})",
-                [body.action, *body.ids],
-            ).rowcount
-        else:
-            raise HTTPException(400, "操作无效")
+    def apply():
+        with get_db() as db:
+            begin_write(db)
+            source_ids = [r[0] for r in db.execute(f"SELECT DISTINCT conversation_id FROM messages WHERE id IN ({marks}) AND conversation_id IS NOT NULL", body.ids)]
+            if body.action == "delete":
+                n = db.execute(f"DELETE FROM messages WHERE id IN ({marks})", body.ids).rowcount
+            elif body.action in STATUSES:
+                n = db.execute(
+                    f"UPDATE messages SET status=?, updated_at={NOW_SQL} WHERE id IN ({marks})",
+                    [body.action, *body.ids],
+                ).rowcount
+            else:
+                raise HTTPException(400, "操作无效")
+        return source_ids, n
+
+    source_ids, n = await run_in_threadpool(apply)
     await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": source_ids})
     return {"ok": True, "affected": n}
 
 
 @app.delete("/api/admin/messages/{msg_id}", tags=["留言"], dependencies=[admin])
 async def delete_message(msg_id: int):
-    with get_db() as db:
-        source = db.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
-        db.execute("DELETE FROM messages WHERE id=?", (msg_id,))
+    def delete():
+        with get_db() as db:
+            begin_write(db)
+            source = db.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
+            db.execute("DELETE FROM messages WHERE id=?", (msg_id,))
+        return source
+
+    source = await run_in_threadpool(delete)
     await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": [source[0]] if source and source[0] else []})
     return {"ok": True}
 

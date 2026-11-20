@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from . import auth, chat
@@ -235,8 +236,8 @@ def build_messages(site: dict, history: list[dict], context: str, extra: str) ->
 
 async def evaluate(site: dict, history: list[dict], question: str, settings: dict | None = None,
                    *, timeout: int = 40) -> AIAnswer:
-    s = settings or ai_settings()
-    context, sources = retrieve_sources(site['id'], question)
+    s = settings or await run_in_threadpool(ai_settings)
+    context, sources = await run_in_threadpool(retrieve_sources, site['id'], question)
     evidence = {'context':context,'sources':sources,'model':s['model'][:200]}
     msgs = build_messages(site, history, context, s['prompt'])
     try:
@@ -248,7 +249,8 @@ async def evaluate(site: dict, history: list[dict], question: str, settings: dic
 
 
 async def ai_answer(site: dict, conv_id: int, question: str) -> AIAnswer:
-    return await evaluate(site, chat.history(conv_id, 12), question, timeout=LIVE_REPLY_SECONDS + 1)
+    history = await run_in_threadpool(chat.history, conv_id, 12)
+    return await evaluate(site, history, question, timeout=LIVE_REPLY_SECONDS + 1)
 
 
 def save_decision(db, conv_id, upto, trigger, question, answer, reason_code, evidence,
@@ -362,7 +364,7 @@ async def _live_answer(site: dict, conv_id: int, question: str, upto: int, *, sh
         async with asyncio.timeout(LIVE_REPLY_SECONDS):
             async with _live_slots:
                 # The agent may have taken over while this request waited for a model slot.
-                conv = chat.conv_summary(conv_id)
+                conv = await run_in_threadpool(chat.conv_summary, conv_id)
                 if (not conv or conv["status"] != "waiting" or conv["ai_waiting_for_agent"]
                         or conv["auto_handled_upto"] >= upto):
                     return None
@@ -375,27 +377,27 @@ async def _live_answer(site: dict, conv_id: int, question: str, upto: int, *, sh
 async def handle_unattended(conv_id: int, reason: str):
     """Respond early when AI is in charge, or archive an unanswered visitor batch."""
     async with _locks[conv_id]:
-        conv = chat.conv_summary(conv_id)
+        conv = await run_in_threadpool(chat.conv_summary, conv_id)
         if not conv or conv["status"] == "closed" or (conv["status"] == "active" and reason not in ("timeout", "timeout_archive")):
             return
-        msgs = _unhandled(conv_id)
+        msgs = await run_in_threadpool(_unhandled, conv_id)
         if not msgs:
             return
-        site = chat.get_site(conv["site_id"])
+        site = await run_in_threadpool(chat.get_site, conv["site_id"])
         if not site or not site["enabled"]:
             return
         waiting_for_agent = bool(conv["ai_waiting_for_agent"])
         human_active = conv["status"] == "active"
-        eligible_ai = not waiting_for_agent and not human_active and ai_ready(site)
+        eligible_ai = not waiting_for_agent and not human_active and await run_in_threadpool(ai_ready, site)
         enabled = eligible_ai and reason != "timeout_archive"
         if reason == "ai_first" and not enabled and not waiting_for_agent:
-            if chat.site_online(site):
+            if await run_in_threadpool(chat.site_online, site):
                 return
             reason = "offline"
         if reason == "offline":
             if enabled:
                 reason = "ai_first"
-            elif chat.site_online(site):
+            elif await run_in_threadpool(chat.site_online, site):
                 return
         if waiting_for_agent:
             note = "等待人工接待"
@@ -414,7 +416,7 @@ async def handle_unattended(conv_id: int, reason: str):
         elif eligible_ai and reason == "timeout_archive":
             reason_code = "first_response_expired"
         question = "\n".join("[图片]" if m["msg_type"] == "image" else m["content"] for m in msgs)
-        if not enabled and reason_code == 'disabled' and ai_settings()['enabled'] and site.get('ai_enabled', 1):
+        if not enabled and reason_code == 'disabled' and (await run_in_threadpool(ai_settings))['enabled'] and site.get('ai_enabled', 1):
             reason_code = 'unconfigured'
         if enabled:
             try:
@@ -428,7 +430,7 @@ async def handle_unattended(conv_id: int, reason: str):
                     handoff, reason_code = True, 'empty_answer'
             except TimeoutError:
                 reason_code = "reply_timeout"
-                evidence = {"model": ai_settings()["model"][:200]}
+                evidence = {"model": (await run_in_threadpool(ai_settings))["model"][:200]}
             except AIError as exc:
                 log(f"#{conv_id} AI 调用失败，改为转留言")
                 answer, handoff = "", True
@@ -451,42 +453,49 @@ async def handle_unattended(conv_id: int, reason: str):
                 raise
         cause = REASONS[reason_code]
         # AI may take seconds; never create a stale handoff after the agent has replied/closed.
-        conv = chat.conv_summary(conv_id)
+        conv = await run_in_threadpool(chat.conv_summary, conv_id)
         if not conv:
             return
         from . import qq_delivery
-        delivery_id, inbox_id, ai_message, notice = None, None, None, None
-        with get_db() as db:
-            begin_write(db)
-            state = db.execute(
-                "SELECT c.status,c.auto_handled_upto,s.enabled,s.ai_enabled FROM conversations c "
-                "JOIN sites s ON s.id=c.site_id WHERE c.id=?", (conv_id,)).fetchone()
-            last_agent = db.execute("SELECT MAX(id) FROM chat_messages WHERE conversation_id=? AND sender='agent'", (conv_id,)).fetchone()[0] or 0
-            upto = msgs[-1]['id']
-            if (not state or not state["enabled"] or state["status"] != starting_status
-                    or state["status"] == "closed" or state["auto_handled_upto"] >= upto or last_agent >= upto):
-                return
-            if enabled and not ai_ready({"enabled": state["enabled"], "ai_enabled": state["ai_enabled"]}):
-                return
-            if handoff:
-                summary = summaries.save(db, summary)
-                detail = note + '；' + cause
-                inbox_id = archive(db, conv, msgs, detail)
-                if not waiting_for_agent:
-                    delivery_id = qq_delivery.enqueue_handoff(db, conv, msgs, detail, inbox_id, answer, summary=summary)
-                if not waiting_for_agent and (not answer or enabled) and not _recent_notice(db, conv_id):
-                    text = HANDOFF_TEXT if enabled else ((site.get("offline_text") or DEFAULT_OFFLINE) if reason == "offline" else TIMEOUT_TEXT)
-                    notice = chat.add_message(conv_id, "system", text, db=db)
-            if answer:
-                ai_message = chat.add_message(conv_id,'ai',answer,db=db)
-            decision_id = save_decision(db,conv_id,upto,note,question,answer,reason_code,evidence,
-                                        message_id=ai_message['id'] if ai_message else None,inbox_id=inbox_id,delivery_id=delivery_id)
-            # Archive, notification snapshot and progress commit together, before network I/O.
-            db.execute(
-                "UPDATE conversations SET auto_handled_upto=?,"
-                "ai_waiting_for_agent=CASE WHEN ? THEN 1 ELSE ai_waiting_for_agent END WHERE id=?",
-                (upto, handoff and (enabled or reason_code == "first_response_expired"), conv_id),
-            )
+        def commit_result(summary):
+            delivery_id, inbox_id, ai_message, notice = None, None, None, None
+            with get_db() as db:
+                begin_write(db)
+                state = db.execute(
+                    "SELECT c.status,c.auto_handled_upto,s.enabled,s.ai_enabled FROM conversations c "
+                    "JOIN sites s ON s.id=c.site_id WHERE c.id=?", (conv_id,)).fetchone()
+                last_agent = db.execute("SELECT MAX(id) FROM chat_messages WHERE conversation_id=? AND sender='agent'", (conv_id,)).fetchone()[0] or 0
+                upto = msgs[-1]['id']
+                if (not state or not state["enabled"] or state["status"] != starting_status
+                        or state["status"] == "closed" or state["auto_handled_upto"] >= upto or last_agent >= upto):
+                    return
+                if enabled and not ai_ready({"enabled": state["enabled"], "ai_enabled": state["ai_enabled"]}):
+                    return
+                if handoff:
+                    summary = summaries.save(db, summary)
+                    detail = note + '；' + cause
+                    inbox_id = archive(db, conv, msgs, detail)
+                    if not waiting_for_agent:
+                        delivery_id = qq_delivery.enqueue_handoff(db, conv, msgs, detail, inbox_id, answer, summary=summary)
+                    if not waiting_for_agent and (not answer or enabled) and not _recent_notice(db, conv_id):
+                        text = HANDOFF_TEXT if enabled else ((site.get("offline_text") or DEFAULT_OFFLINE) if reason == "offline" else TIMEOUT_TEXT)
+                        notice = chat.add_message(conv_id, "system", text, db=db)
+                if answer:
+                    ai_message = chat.add_message(conv_id,'ai',answer,db=db)
+                decision_id = save_decision(db,conv_id,upto,note,question,answer,reason_code,evidence,
+                                            message_id=ai_message['id'] if ai_message else None,inbox_id=inbox_id,delivery_id=delivery_id)
+                # Archive, notification snapshot and progress commit together, before network I/O.
+                db.execute(
+                    "UPDATE conversations SET auto_handled_upto=?,"
+                    "ai_waiting_for_agent=CASE WHEN ? THEN 1 ELSE ai_waiting_for_agent END WHERE id=?",
+                    (upto, handoff and (enabled or reason_code == "first_response_expired"), conv_id),
+                )
+            return delivery_id, inbox_id, ai_message, notice, summary, decision_id
+
+        saved = await run_in_threadpool(commit_result, summary)
+        if saved is None:
+            return
+        delivery_id, inbox_id, ai_message, notice, summary, decision_id = saved
         if handoff and (enabled or reason_code == "first_response_expired"):
             await chat.hub.to_visitor(conv_id, {"type": "ai_status", "thinking": False, "handoff": True})
         if ai_message:
@@ -538,12 +547,12 @@ def _schedule(cid: int, reason: str, delay: float):
 async def on_visitor_message(conv: dict, msg: dict):
     if not conv or conv["status"] != "waiting":
         return
-    site = chat.get_site(conv["site_id"])
+    site = await run_in_threadpool(chat.get_site, conv["site_id"])
     if not site or not site["enabled"]:
         return
-    if conv["ai_waiting_for_agent"] or ai_ready(site):
+    if conv["ai_waiting_for_agent"] or await run_in_threadpool(ai_ready, site):
         _schedule(conv["id"], "ai_first", MERGE_SECONDS)
-    elif not chat.site_online(site):
+    elif not await run_in_threadpool(chat.site_online, site):
         _schedule(conv["id"], "offline", MERGE_SECONDS)
 
 
@@ -561,33 +570,37 @@ _WAITING_MESSAGES = """
 
 
 async def _recover_ai_loop():
+    def recent_conversations():
+        if not ai_configured(ai_settings()):
+            return []
+        with get_db() as db:
+            return [row[0] for row in db.execute(
+                _WAITING_MESSAGES + " AND c.status='waiting' AND (s.ai_enabled=1 OR c.ai_waiting_for_agent=1) "
+                "AND m.created_at >= ? GROUP BY c.id HAVING MAX(m.created_at) <= ? ORDER BY latest_at LIMIT 100",
+                (since(minutes=2), since(seconds=MERGE_SECONDS + 1)))]
+
     while True:
         await asyncio.sleep(MERGE_SECONDS)
         try:
-            if not ai_configured(ai_settings()):
-                continue
-            with get_db() as db:
-                recent = [row[0] for row in db.execute(
-                    _WAITING_MESSAGES + " AND c.status='waiting' AND (s.ai_enabled=1 OR c.ai_waiting_for_agent=1) "
-                    "AND m.created_at >= ? GROUP BY c.id HAVING MAX(m.created_at) <= ? ORDER BY latest_at LIMIT 100",
-                    (since(minutes=2), since(seconds=MERGE_SECONDS + 1)))]
-            for cid in recent:
+            for cid in await run_in_threadpool(recent_conversations):
                 _schedule(cid, "ai_first", 0)
         except Exception as exc:
             log(f"AI 接待恢复检查异常：{type(exc).__name__}")
 
 
 async def _timeout_loop():
+    def expired_conversations():
+        settings = ai_settings()
+        with get_db() as db:
+            return [row[0] for row in db.execute(
+                _WAITING_MESSAGES + " GROUP BY c.id HAVING MIN(m.created_at)<=? LIMIT 100",
+                (since(minutes=settings['no_reply_minutes']),))]
+
     while True:
         await asyncio.sleep(20)
         try:
-            settings = ai_settings()
-            with get_db() as db:
-                pending = rows(db.execute(
-                    _WAITING_MESSAGES + " GROUP BY c.id HAVING MIN(m.created_at)<=? LIMIT 100",
-                    (since(minutes=settings['no_reply_minutes']),)))
-            for row in pending:
-                _schedule(row["id"], "timeout_archive", 0)
+            for cid in await run_in_threadpool(expired_conversations):
+                _schedule(cid, "timeout_archive", 0)
         except Exception as exc:
             log(f"超时检查异常：{type(exc).__name__}")
 
@@ -748,16 +761,19 @@ async def run_crawl(site: dict):
 
 
 async def _crawl_loop():
+    def due_sites():
+        if not ai_settings()["enabled"]:
+            return []
+        with get_db() as db:
+            sites = rows(db.execute("SELECT * FROM sites WHERE enabled = 1 AND ai_enabled = 1"))
+        return [site for site in sites if crawl_starts(site)
+                and time.time() - int(get_setting(f"crawl_at_{site['id']}", "0") or 0) > CRAWL_INTERVAL]
+
     await asyncio.sleep(60)
     while True:
         try:
-            if ai_settings()["enabled"]:
-                with get_db() as db:
-                    sites = rows(db.execute("SELECT * FROM sites WHERE enabled = 1 AND ai_enabled = 1"))
-                for site in sites:
-                    last = int(get_setting(f"crawl_at_{site['id']}", "0") or 0)
-                    if crawl_starts(site) and time.time() - last > CRAWL_INTERVAL:
-                        await run_crawl(site)
+            for site in await run_in_threadpool(due_sites):
+                await run_crawl(site)
         except Exception as e:  # noqa: BLE001
             log(f"定时抓取异常：{e!r}")
         await asyncio.sleep(3600)
@@ -816,10 +832,10 @@ class AITestIn(BaseModel):
 
 @router.post("/api/admin/ai/test", tags=["AI"], dependencies=[admin])
 async def test_ai(body: AITestIn):
-    s = ai_settings()
+    s = await run_in_threadpool(ai_settings)
     if not (s["base_url"] and s["api_key"] and s["model"]):
         raise HTTPException(400, "请先填写接口地址、API Key 和模型名称")
-    site = chat.get_site(body.site_id) if body.site_id else None
+    site = await run_in_threadpool(chat.get_site, body.site_id) if body.site_id else None
     if body.site_id and not site:
         raise HTTPException(404,'站点不存在')
     site = site or {"id": 0, "name": "测试站点"}
@@ -889,7 +905,7 @@ def kb_status(site_id: int):
 
 @router.post("/api/admin/kb/{site_id}/crawl", tags=["AI"], dependencies=[admin])
 async def kb_crawl(site_id: int):
-    site = chat.get_site(site_id)
+    site = await run_in_threadpool(chat.get_site, site_id)
     if not site:
         raise HTTPException(404, "站点不存在")
     if not crawl_starts(site):

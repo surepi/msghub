@@ -306,6 +306,28 @@ class QQDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(chat.history(cid)), 1)
         self.assertEqual(len(chat.history(other)), 1)
 
+    async def test_implicit_reply_rechecks_default_when_committing(self):
+        from unittest.mock import AsyncMock
+        from app import chat, qq_inbound
+
+        target, _ = self.conversation("original default")
+        other, _ = self.conversation("new default")
+        self.qq.update_agent(current_conv_id=target, current_set_at=0)
+        self.enqueue_reply("late-default-change", "must not reach either visitor")
+        commit = qq_inbound.commit_reply
+
+        def switch_before_commit(*args):
+            self.qq.update_agent(current_conv_id=other, current_set_at=0)
+            return commit(*args)
+
+        with patch.object(qq_inbound, "commit_reply", side_effect=switch_before_commit), \
+                patch.object(self.qq, "deliver", new_callable=AsyncMock) as ack:
+            self.assertTrue(await qq_inbound.process_one())
+            self.assertIn("当前会话刚切换", ack.call_args.args[0])
+        self.assertEqual(self.inbound_rows()[0]["status"], "done")
+        self.assertEqual(len(chat.history(target)), 1)
+        self.assertEqual(len(chat.history(other)), 1)
+
     async def test_inbound_quotes_fail_closed_and_explicit_target_is_supported(self):
         from unittest.mock import AsyncMock
         from app import chat, qq_inbound
@@ -464,6 +486,37 @@ class QQDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(pending, 1), 0)
         for ws in sockets:
             self.assertEqual(ws.send_json.await_count, int(ws is first))
+
+    async def test_visitor_worker_rolls_back_conversation_and_message_together(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        from fastapi import HTTPException, WebSocketDisconnect
+        from app import chat
+
+        ws = Mock(headers={}, client=SimpleNamespace(host="rollback-fixture"))
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+        ws.send_json = AsyncMock()
+        ws.receive_json = AsyncMock(side_effect=[
+            {"type": "hello", "site_key": "qq-test-key"},
+            {"type": "msg", "content": "rolled back"},
+            WebSocketDisconnect(),
+        ])
+        with self.db.get_db() as db:
+            db.execute("UPDATE sites SET require_contact=0 WHERE id=?", (self.site,))
+        original = chat.add_message
+
+        def fail_write(*args, **kwargs):
+            original(*args, **kwargs)
+            raise HTTPException(400, "fixture write failure")
+
+        with patch.object(chat, "add_message", side_effect=fail_write), patch.object(chat, "broadcast_message") as broadcast:
+            await chat.visitor_ws(ws)
+            broadcast.assert_not_called()
+        self.assertEqual(ws.send_json.await_args.args[0]["error"], "fixture write failure")
+        with self.db.get_db() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM conversations WHERE site_id=?", (self.site,)).fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0], 0)
 
     async def test_handoff_snapshot_dedup_archive_merge_and_quote(self):
         from unittest.mock import AsyncMock
@@ -1203,6 +1256,7 @@ class QQDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await triage.on_visitor_message({'id':cid,'site_id':self.site},{'id':mid})
         new=chat.add_message(cid,'visitor','紧急故障需要处理')['id']
         await triage.on_visitor_message({'id':cid,'site_id':self.site},{'id':new})
+        await triage.on_visitor_message({'id':cid,'site_id':self.site},{'id':mid})
         with self.db.get_db() as db:
             self.assertEqual(db.execute('SELECT source_upto FROM conversation_triage_jobs WHERE conversation_id=?',(cid,)).fetchone()[0],new)
         with patch.object(auto,'_completion',side_effect=auto.AIError('triage-provider-secret')):
