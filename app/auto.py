@@ -325,12 +325,12 @@ def archive(db, conv: dict, msgs: list[dict], note: str):
         "AND created_at >= datetime('now','localtime','-1 day') ORDER BY id DESC LIMIT 1", (conv["id"],)).fetchone()
     if existing:
         db.execute("UPDATE messages SET content = ?, updated_at = datetime('now','localtime') WHERE id = ?",
-                   ((existing["content"] + "\n\n" + text)[-5000:], existing["id"]))
+                   (existing["content"] + "\n\n" + text, existing["id"]))
         return existing['id']
     return db.execute(
         "INSERT INTO messages (site_id, name, contact, content, page_url, ip, user_agent, conversation_id) "
         "VALUES (?,?,?,?,?,?,?,?)",
-        (conv["site_id"], v["name"], v["contact"], text[-5000:], conv["page_url"], v["ip"], v["user_agent"], conv["id"])).lastrowid
+        (conv["site_id"], v["name"], v["contact"], text, conv["page_url"], v["ip"], v["user_agent"], conv["id"])).lastrowid
 
 
 def _recent_notice(db, conv_id: int) -> bool:

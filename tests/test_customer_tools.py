@@ -3,6 +3,8 @@
 Each run uses a temporary database and a separate Uvicorn process.
 No production configuration, QQ credentials or existing records are used.
 """
+import csv
+import io
 import json
 import os
 from pathlib import Path
@@ -302,7 +304,8 @@ class CustomerToolsTests(unittest.TestCase):
             admin_ws.send(json.dumps({"type":"auth","token":self.token}))
             self.assertEqual(json.loads(admin_ws.recv())["type"],"ready")
             visitor.send(json.dumps({"type":"hello","site_key":site["site_key"]})); visitor.recv()
-            visitor.send(json.dumps({"type":"msg","content":"Offline question one"}))
+            questions = ["甲" * 5000, "乙" * 5000, "丙" * 5000]
+            visitor.send(json.dumps({"type":"msg","content":questions[0]}))
             visitor_token = None
             while True:
                 event=json.loads(visitor.recv(timeout=5))
@@ -318,15 +321,26 @@ class CustomerToolsTests(unittest.TestCase):
             path=f"/api/admin/conversations/{conv['id']}/inbox-messages"
             first=self.request("GET",path)[1]
             self.assertEqual(first["total"],1)
-            self.assertIn("Offline question one",first["items"][0]["content"])
+            self.assertIn(questions[0],first["items"][0]["content"])
             self.assertEqual(first["items"][0]["linked_conversation_id"],conv["id"])
-            visitor.send(json.dumps({"type":"msg","content":"Offline question two"}))
-            while json.loads(visitor.recv(timeout=5)).get("type")!="msg": pass
-            wait_inbox()
+            for question in questions[1:]:
+                visitor.send(json.dumps({"type":"msg","content":question}))
+                while json.loads(visitor.recv(timeout=5)).get("type")!="msg": pass
+                wait_inbox()
             merged=self.request("GET",path)[1]
             self.assertEqual(merged["total"],1)
-            self.assertIn("Offline question two",merged["items"][0]["content"])
             mid=merged["items"][0]["id"]
+            detail = self.request("GET", f"/api/admin/messages/{mid}")[1]
+            self.assertEqual(detail["content"], merged["items"][0]["content"])
+            for question in questions:
+                self.assertIn(question, detail["content"])
+            export = urllib.request.Request(
+                f"{self.base}/api/admin/messages/export.csv?site_id={site['id']}",
+                headers={"Authorization": "Bearer " + self.token},
+            )
+            with urllib.request.urlopen(export, timeout=5) as response:
+                exported = list(csv.DictReader(io.StringIO(response.read().decode("utf-8-sig"))))
+            self.assertEqual([row["内容"] for row in exported], [detail["content"]])
             self.request("PATCH",f"/api/admin/messages/{mid}",{"note":"Secret inbox handling","status":"handled"})
             self.assertEqual(wait_inbox()["conversation_ids"],[conv["id"]])
             with self.assertRaises(TimeoutError): visitor.recv(timeout=.2)
