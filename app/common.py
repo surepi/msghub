@@ -4,7 +4,7 @@ import re
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
 DEFAULT_WELCOME = "您好，请问有什么可以帮您？"
 DEFAULT_OFFLINE = "客服当前不在线，您可以先留言，我们上班后会尽快通过您留下的联系方式联系您。"
@@ -41,12 +41,13 @@ def in_work_hours(raw: str, now: datetime | None = None) -> bool:
     if not wh:
         return True
     now = now or datetime.now()
-    if now.isoweekday() not in wh["days"]:
-        return False
+    days, start, end = wh["days"], wh["start"], wh["end"]
     hm = now.strftime("%H:%M")
-    if wh["start"] <= wh["end"]:
-        return wh["start"] <= hm < wh["end"]
-    return hm >= wh["start"] or hm < wh["end"]   # 跨午夜，如 20:00–02:00
+    if start <= end:
+        return now.isoweekday() in days and start <= hm < end
+    if hm >= start:
+        return now.isoweekday() in days
+    return hm < end and (now - timedelta(days=1)).isoweekday() in days
 
 
 class RateLimiter:

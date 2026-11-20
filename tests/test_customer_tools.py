@@ -15,9 +15,30 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime
 from urllib.parse import urlencode
 
 from websockets.sync.client import connect
+
+
+class WorkHoursTests(unittest.TestCase):
+    def test_overnight_hours_follow_the_day_the_shift_started(self):
+        from app.common import in_work_hours
+
+        cases = [
+            ([1], "20:00", "02:00", datetime(2026, 11, 23, 1), False),
+            ([1], "20:00", "02:00", datetime(2026, 11, 23, 20), True),
+            ([1], "20:00", "02:00", datetime(2026, 11, 24, 1), True),
+            ([1], "20:00", "02:00", datetime(2026, 11, 24, 2), False),
+            ([7], "20:00", "02:00", datetime(2026, 11, 23, 1), True),
+            ([1], "09:00", "18:00", datetime(2026, 11, 23, 9), True),
+            ([1], "09:00", "18:00", datetime(2026, 11, 23, 18), False),
+            ([1], "00:00", "00:00", datetime(2026, 11, 23), False),
+        ]
+        for days, start, end, now, expected in cases:
+            with self.subTest(days=days, start=start, end=end, now=now):
+                schedule = json.dumps({"days": days, "start": start, "end": end})
+                self.assertEqual(in_work_hours(schedule, now), expected)
 
 
 class CustomerToolsTests(unittest.TestCase):
