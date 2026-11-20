@@ -86,17 +86,32 @@ async function mountWidget(page, key, form = false) {
     await visitor.locator(".mh-foot .mh-btn").click();
 
     const conversation = admin.locator(".conv").filter({ hasText: "访客首条验收消息" });
+    await admin.bringToFront();
     await conversation.click();
     await expect(admin.locator("#chatMsgs")).toContainText("访客首条验收消息");
     const id = await conversation.getAttribute("data-id");
+    const unread = async () => (await (await api.get(`/api/admin/conversations/${id}`, { headers })).json()).conversation.unread;
+    await expect.poll(unread).toBe(0);
     await admin.locator("#replyInput").fill("管理员草稿");
+    let resumeSync;
+    const heldSync = new Promise(resolve => { resumeSync = resolve; });
+    const syncUrl = `**/api/admin/conversations/${id}/messages?limit=500`;
+    await admin.route(syncUrl, async route => { await heldSync; await route.continue(); });
     await admin.evaluate(() => window.adminSocket.close());
     await expect(admin.locator("#chatLinkState")).toContainText("正在重连", { timeout: 2500 });
     const missedMessage = await api.post(`/api/admin/conversations/${id}/messages`, {
       headers, data: { content: "断线期间的回复" }
     });
     assert(missedMessage.ok());
+    await composer.fill("断线期间的访客消息");
+    await visitor.locator(".mh-foot .mh-btn").click();
+    await expect.poll(unread).toBe(1);
+    await admin.bringToFront();
+    resumeSync();
     await expect(admin.locator("#chatMsgs")).toContainText("断线期间的回复");
+    await expect(admin.locator("#chatMsgs")).toContainText("断线期间的访客消息");
+    await expect.poll(unread).toBe(0);
+    await admin.unroute(syncUrl);
     await expect(admin.locator("#chatMsgs .msg").filter({ hasText: "断线期间的回复" })).toHaveCount(1);
     await expect(admin.locator("#replyInput")).toHaveValue("管理员草稿");
     await admin.setViewportSize({ width: 390, height: 844 });

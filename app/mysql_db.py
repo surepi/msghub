@@ -118,6 +118,8 @@ def init_db(conn, default_tags):
     if not conn.execute("SHOW COLUMNS FROM visitors LIKE 'site_id'").fetchone():
         conn.execute("ALTER TABLE visitors ADD COLUMN site_id BIGINT, "
                      "ADD FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE")
+    if not conn.execute("SHOW COLUMNS FROM conversations LIKE 'read_upto'").fetchone():
+        conn.execute("ALTER TABLE conversations ADD COLUMN read_upto BIGINT NOT NULL DEFAULT 0")
     # The upsert claims the initialization row through the commit that seeds the tables.
     with conn.cursor() as cursor:
         cursor.execute("INSERT INTO schema_state (id) VALUES (1) ON DUPLICATE KEY UPDATE id = id")

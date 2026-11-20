@@ -340,6 +340,7 @@ class CustomerToolsTests(unittest.TestCase):
         detail = self.request("GET", path + "?message_id=" + str(ids[10]))[1]
         self.assertIn(ids[10], [m["id"] for m in detail["messages"]])
         self.assertTrue(detail["has_newer"])
+        self.assertEqual(detail["conversation"]["unread"], 7)
         latest = self.request("GET", path)[1]
         self.assertEqual([m["id"] for m in latest["messages"]], ids[-500:])
         self.assertTrue(latest["has_older"])
@@ -352,6 +353,66 @@ class CustomerToolsTests(unittest.TestCase):
                             ("/api/admin/conversations/999999/messages",404)):
             self.assertEqual(self.request("GET", route)[0], code)
         self.assertEqual(self.request("GET", path+"/messages", authenticated=False)[0],401)
+
+    def test_read_cursor_keeps_later_messages_unread(self):
+        site = self.sites[0]
+        now = datetime.now().isoformat(sep=" ", timespec="seconds")
+        cid, ids = self.seed_search_conversation(site, messages=[(f"Visitor message {i}", now, "text") for i in range(3)])
+        _, other_ids = self.seed_search_conversation(self.sites[1])
+        path = f"/api/admin/conversations/{cid}"
+        with sqlite3.connect(Path(self.tmp.name) / "msghub.db") as db:
+            db.execute("UPDATE conversations SET unread=3 WHERE id=?", (cid,))
+            visitor = db.execute("SELECT visitor_id FROM conversations WHERE id=?", (cid,)).fetchone()[0]
+            token = db.execute("SELECT token FROM visitors WHERE id=?", (visitor,)).fetchone()[0]
+
+        def state():
+            conv = self.request("GET", path)[1]["conversation"]
+            return conv["read_upto"], conv["unread"]
+
+        self.assertEqual(state(), (0, 3))
+        self.assertEqual(self.request("POST", path + "/read", {"upto_id": other_ids[0]})[0], 404)
+        self.assertEqual(self.request("POST", path + "/read")[0], 422)
+        with connect(self.ws_base + "/api/chat/ws") as ws:
+            ws.send(json.dumps({"type": "hello", "site_key": site["site_key"], "token": token}))
+            self.assertEqual(json.loads(ws.recv(timeout=3))["type"], "init")
+            ws.send('{"type":"msg","content":"Arrived after the displayed page"}')
+            later = json.loads(ws.recv(timeout=3))["message"]["id"]
+            self.assertEqual(state(), (0, 4))
+            for upto in (ids[-1], ids[0], ids[-1]):
+                self.assertEqual(self.request("POST", path + "/read", {"upto_id": upto})[0], 200)
+                self.assertEqual(state(), (ids[-1], 1))
+            reply = self.request("POST", path + "/messages", {"content": "Answered"})[1]["message"]
+            self.assertEqual(state(), (reply["id"], 0))
+            self.assertEqual(self.request("POST", path + "/read", {"upto_id": later})[0], 200)
+            self.assertEqual(state(), (reply["id"], 0))
+
+    def test_read_cursor_migrates_legacy_counts_and_can_be_run_again(self):
+        with tempfile.TemporaryDirectory() as folder:
+            env = {**self.env, "DATA_DIR": folder}
+            migrate = [sys.executable, "-m", "app.db"]
+            subprocess.run(migrate, env=env, check=True)
+            with sqlite3.connect(Path(folder) / "msghub.db") as db:
+                db.execute("UPDATE settings SET value='1' WHERE key='read_cursor_version'")
+                db.execute("ALTER TABLE conversations DROP COLUMN read_upto")
+                site = db.execute("INSERT INTO sites (name,site_key) VALUES ('Migration','migration')").lastrowid
+                expected = []
+                for unread in (0, 2, 5):
+                    visitor = db.execute("INSERT INTO visitors (token) VALUES (?)", (str(unread),)).lastrowid
+                    cid = db.execute("INSERT INTO conversations (site_id,visitor_id,unread) VALUES (?,?,?)",
+                                     (site, visitor, unread)).lastrowid
+                    visitors = []
+                    for sender in ("visitor", "agent", "visitor", "ai", "visitor"):
+                        mid = db.execute("INSERT INTO chat_messages (conversation_id,sender,content) VALUES (?,?,'old')",
+                                         (cid, sender)).lastrowid
+                        if sender == "visitor":
+                            visitors.append(mid)
+                    already_read = visitors[:max(0, len(visitors) - unread)]
+                    expected.append((min(unread, len(visitors)), already_read[-1] if already_read else 0))
+            for _ in range(2):
+                subprocess.run(migrate, env=env, check=True)
+                with sqlite3.connect(Path(folder) / "msghub.db") as db:
+                    self.assertEqual(db.execute("SELECT unread,read_upto FROM conversations ORDER BY id").fetchall(), expected)
+                    self.assertEqual(db.execute("SELECT value FROM settings WHERE key='read_cursor_version'").fetchone(), ("2",))
 
     def seed_inbox_message(self, site_id, conv_id=None, content="Inbox entry", status="new", note="Private inbox note"):
         with sqlite3.connect(Path(self.tmp.name) / "msghub.db") as db:

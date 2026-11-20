@@ -28,8 +28,11 @@ assert os.environ['DATA_DIR']=='/tmp/acceptance' and os.environ['ADMIN_PASSWORD'
 with sqlite3.connect(DB_PATH) as db:
     convs=[]; target=None
     for i in range(35):
-        v=db.execute('INSERT INTO visitors (token,name,contact) VALUES (?,?,?)',(secrets.token_hex(16),'分页客户'+str(i),'customer'+str(i)+'@example.com')).lastrowid
-        c=db.execute("INSERT INTO conversations (site_id,visitor_id,last_preview,last_msg_at,unread) VALUES (?,?,?,'2026-02-11 12:00:00',1)",(int(sys.argv[1 if i<34 else 2]),v,'最新消息不含关键词')).lastrowid
+        site_id=int(sys.argv[1 if i<34 else 2])
+        visitor_token=secrets.token_hex(16)
+        if i==0: target_token=visitor_token
+        v=db.execute('INSERT INTO visitors (token,name,contact) VALUES (?,?,?)',(visitor_token,'分页客户'+str(i),'customer'+str(i)+'@example.com')).lastrowid
+        c=db.execute("INSERT INTO conversations (site_id,visitor_id,last_preview,last_msg_at,unread) VALUES (?,?,?,'2026-02-11 12:00:00',1)",(site_id,v,'最新消息不含关键词')).lastrowid
         convs.append(c)
         for j in range(620 if i==0 else 2):
             text='<img src=x onerror="window.searchXss=true"> QuotedNeedle '+('后文'*100) if i==0 and j==80 else '普通消息 '+str(j)
@@ -39,7 +42,7 @@ with sqlite3.connect(DB_PATH) as db:
         # These are historical search fixtures, already handled by the unattended flow.
         # Otherwise its 20-second scan adds a system notice during pagination checks.
         db.execute('UPDATE conversations SET auto_handled_upto=? WHERE id=?',(mid,c))
-    print(json.dumps({'convs':convs,'target':target}))
+    print(json.dumps({'convs':convs,'target':target,'token':target_token}))
 ` }));
     const targetConv=fixture.convs[0];
     const tag=await call('post','/api/admin/tags',{name:'搜索组合验收'}); tags.push(tag.id);
@@ -48,6 +51,21 @@ with sqlite3.connect(DB_PATH) as db:
     await ctx.addInitScript(token=>localStorage.setItem('msghub_token',token),token);
     const page=await ctx.newPage(); page.on('pageerror',e=>errors.push(e.message));
     await page.goto(base);
+    const sendVisitor=content=>page.evaluate(({siteKey, token, content})=>new Promise((resolve, reject)=>{
+      const ws=new WebSocket(location.origin.replace(/^http/, "ws")+"/api/chat/ws");
+      const timer=setTimeout(()=>{ws.close();reject(new Error("Visitor fixture timed out"));}, 4000);
+      ws.onopen=()=>ws.send(JSON.stringify({type:"hello", site_key:siteKey, token}));
+      ws.onmessage=event=>{
+        const data=JSON.parse(event.data);
+        if(data.type==="init") ws.send(JSON.stringify({type:"msg", content, client_id:"read-fixture"}));
+        if(data.type==="error" || data.client_id==="read-fixture") {
+          clearTimeout(timer); ws.close();
+          if(data.type==="error") reject(new Error(data.error));
+          else resolve(data.message.id);
+        }
+      };
+    }), {siteKey:sites[0].site_key, token:fixture.token, content});
+    const unread=async()=>(await call('get','/api/admin/conversations/'+targetConv)).conversation.unread;
     await expect(page.locator('#liveState')).toHaveText('● 实时连接正常');
     await expect(page.locator('.conv')).toHaveCount(30);
     await page.locator('.conv-check').first().check();
@@ -86,12 +104,21 @@ with sqlite3.connect(DB_PATH) as db:
     await page.locator('#loadNewer').click();
     await expect(page.locator('#chatMsgs .msg')).toHaveCount(230);
     const before=await page.locator('#chatMsgs .msg').count();
-    await call('post','/api/admin/conversations/'+targetConv+'/messages',{content:'历史窗口外的新消息'});
+    await sendVisitor('历史窗口外的新消息');
+    await expect.poll(unread).toBe(1);
+    await expect(page.locator('.conv .unread')).toHaveText('1');
     await expect(page.locator('#chatMsgs .msg')).toHaveCount(before);
     await page.locator('#jumpLatest').click();
     await expect(page.locator('#chatMsgs')).toContainText('历史窗口外的新消息');
     await expect(page.locator('#jumpLatest')).toBeHidden();
+    await expect.poll(unread).toBe(0);
     await expect(page.locator('#convNoteInput')).toHaveValue('搜索期间备注草稿');
+    await page.locator('#chatMsgs').evaluate(box=>box.scrollTop=0);
+    await sendVisitor('滚动区下方的新消息');
+    await expect(page.locator('#chatMsgs')).toContainText('滚动区下方的新消息');
+    await expect.poll(unread).toBe(1);
+    await page.locator('#chatMsgs').evaluate(box=>box.scrollTop=box.scrollHeight);
+    await expect.poll(unread).toBe(0);
     // A message arriving after the latest-history snapshot must survive its delayed response.
     await page.locator('.conv-match').click();
     let releaseLatest, latestStarted;

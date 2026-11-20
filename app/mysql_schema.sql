@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     last_msg_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_preview LONGTEXT NOT NULL DEFAULT (''),
     unread BIGINT NOT NULL DEFAULT 0,
+    read_upto BIGINT NOT NULL DEFAULT 0,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     closed_at DATETIME,
     UNIQUE (site_id, visitor_id),

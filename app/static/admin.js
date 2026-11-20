@@ -161,6 +161,7 @@
     ["chats", "messages", "sites", "ai", "replies"].forEach((n) => $("#view-" + n).classList.toggle("hidden", v !== n));
     document.body.dataset.view = v;
     if (!token) return;
+    if (v === "chats") markCurRead();
     if (v === "sites") { loadSites(); loadQQ(); }
     if (v === "ai") loadAI();
     if (v === "messages") loadMessages().catch((err) => toast(err.message));
@@ -1091,6 +1092,7 @@
   // ---------- 对话 ----------
   const chat = { list: [], cur: null, notes: [], selected: new Set(), msgIds: new Set(), ws: null, retry: 0, timer: null, ping: null, openSeq: 0, listSeq: 0,
     page: 1, size: 30, total: 0, loading: false, messages: [], hasOlder: false, hasNewer: false, historyBusy: false };
+  let pendingRead = null;
   const CONV_STATUS = { waiting: "待回复", active: "进行中", closed: "已结束" };
   const CONV_TAG = { waiting: "new", active: "handled", closed: "read" };
   const shortTime = (s) => String(s || "").slice(5, 16);
@@ -1398,7 +1400,11 @@
       box.scrollTop = direction === "latest" ? box.scrollHeight : direction === "older" ? top + box.scrollHeight - height : top;
     } catch (err) { toast(err.message); }
     finally {
-      if (chat.openSeq === seq) { chat.historyBusy = false; renderHistoryControls(); }
+      if (chat.openSeq === seq) {
+        chat.historyBusy = false;
+        renderHistoryControls();
+        markCurRead();
+      }
     }
   }
 
@@ -1529,6 +1535,8 @@
       }
     }
     renderConvList();
+    $("#chatMsgs").addEventListener("scroll", markCurRead, { passive: true });
+    markCurRead();
     $("#replyBtn").onclick = sendReply;
     $("#replyPic").onclick = () => $("#replyFile").click();
     $("#replyFile").onchange = (e) => { sendImageReply(e.target.files[0]); e.target.value = ""; };
@@ -1660,10 +1668,26 @@
     qTimer = setTimeout(changeConvFilters, 300);
   });
 
-  function markCurRead() {
-    if (chat.cur && chat.cur.unread && !document.hidden) {
-      api(`/api/admin/conversations/${chat.cur.id}/read`, { method: "POST" }).catch(() => {});
+  async function markCurRead() {
+    if (!chat.cur || chat.hasNewer || chat.recovering || chat.historyBusy ||
+        document.hidden || document.body.dataset.view !== "chats") return;
+    const box = $("#chatMsgs"), last = box?.lastElementChild;
+    const id = chat.cur.id, upto = Number(last?.dataset.messageId);
+    if (!upto || upto <= chat.cur.read_upto || pendingRead?.id === id || !box.clientHeight) return;
+    const message = last.getBoundingClientRect(), view = box.getBoundingClientRect();
+    if (message.top >= view.bottom || message.bottom <= view.top) return;
+
+    const pending = { id };
+    pendingRead = pending;
+    try {
+      await api(`/api/admin/conversations/${id}/read`, { method: "POST", body: { upto_id: upto } });
+      if (chat.cur?.id === id) chat.cur.read_upto = Math.max(chat.cur.read_upto || 0, upto);
+    } catch (_) {
+      return;
+    } finally {
+      if (pendingRead === pending) pendingRead = null;
     }
+    markCurRead();
   }
   document.addEventListener("visibilitychange", markCurRead);
 
@@ -1714,9 +1738,9 @@
       }
       chat.missed = [];
       chat.recovering = false;
-      markCurRead();
       box.classList.add("hidden");
       renderHistoryControls();
+      markCurRead();
     } catch (err) {
       if (seq === chat.openSeq && chat.live && chat.syncing === sync) panelStatus(box, "消息同步失败 · " + err.message, syncOpenChat);
     } finally {
@@ -1809,7 +1833,7 @@
         const isCur = chat.cur && chat.cur.id === d.conversation.id;
         if (isCur) receiveChatMessage(d.message);
         upsertConv(d.conversation);
-        if (isCur && d.message.sender === "visitor" && !chat.recovering) markCurRead();
+        if (isCur && d.message.sender === "visitor") markCurRead();
         if (d.message.sender === "visitor" && (!isCur || document.hidden)) notify(d.conversation, d.message);
         refreshStats();
       } else if (d.type === "conv") {

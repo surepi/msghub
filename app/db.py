@@ -3,6 +3,8 @@ from contextlib import contextmanager
 
 from .config import DB_PATH
 
+READ_CURSOR_SCHEMA_VERSION = "2"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sites (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,6 +59,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     last_msg_at   TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
     last_preview  TEXT    NOT NULL DEFAULT '',
     unread        INTEGER NOT NULL DEFAULT 0,         -- 客服未读的访客消息数
+    read_upto     INTEGER NOT NULL DEFAULT 0,
     created_at    TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
     closed_at     TEXT,
     UNIQUE (site_id, visitor_id)
@@ -328,7 +331,12 @@ MIGRATIONS = {
         ("ai_enabled", "INTEGER NOT NULL DEFAULT 1"),                   # 该站点是否使用 AI 应答（需全局开启）
         ("crawl_urls", "TEXT NOT NULL DEFAULT ''"),                     # 抓取起始地址，每行一个
     ],
-    "conversations": [("ai_waiting_for_agent", "INTEGER NOT NULL DEFAULT 0"), ("ai_priority_dismissed_upto", "INTEGER NOT NULL DEFAULT 0"), ("auto_handled_upto", "INTEGER NOT NULL DEFAULT 0")],  # 已由 AI / 转留言处理到的访客消息 ID
+    "conversations": [
+        ("ai_waiting_for_agent", "INTEGER NOT NULL DEFAULT 0"),
+        ("ai_priority_dismissed_upto", "INTEGER NOT NULL DEFAULT 0"),
+        ("auto_handled_upto", "INTEGER NOT NULL DEFAULT 0"),
+        ("read_upto", "INTEGER NOT NULL DEFAULT 0"),
+    ],
 }
 
 STATUSES = ("new", "read", "handled", "spam")
@@ -359,12 +367,37 @@ def get_db():
         conn.close()
 
 
+def begin_write(db):
+    db.execute("BEGIN IMMEDIATE")
+
+
+def _migrate_read_cursor(conn):
+    state = conn.execute("SELECT value FROM settings WHERE `key` = ?", ("read_cursor_version",)).fetchone()
+    version = state[0] if state else None
+    if version == READ_CURSOR_SCHEMA_VERSION:
+        return
+    # The last unread visitor messages remain unread when upgrading from a count.
+    legacy = conn.execute(
+        "SELECT c.id, c.unread, COUNT(m.id), COALESCE(MAX(CASE WHEN m.visitor_rank > c.unread THEN m.id END), 0) "
+        "FROM conversations c LEFT JOIN ("
+        "SELECT conversation_id, id, ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY id DESC) AS visitor_rank "
+        "FROM chat_messages WHERE sender = 'visitor'"
+        ") m ON m.conversation_id = c.id GROUP BY c.id, c.unread"
+    ).fetchall()
+    conn.executemany("UPDATE conversations SET unread=?, read_upto=? WHERE id=?",
+                     [(min(unread, count), upto, cid) for cid, unread, count, upto in legacy])
+    conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 ("read_cursor_version", READ_CURSOR_SCHEMA_VERSION))
+
+
 def init_db():
     with get_db() as conn:
         new_tags = not conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tags'"
         ).fetchone()
         conn.executescript(SCHEMA)
+        begin_write(conn)
         if new_tags:
             conn.executemany("INSERT INTO tags (name) VALUES (?)",
                              [(name,) for name in ("待报价", "售后", "投诉", "重点客户", "已转化")])
@@ -376,6 +409,7 @@ def init_db():
         # The legacy messages.conversation_id column must exist before creating this index.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, site_id, id)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_qq_delivery_event ON qq_deliveries(event_key) WHERE event_key IS NOT NULL")
+        _migrate_read_cursor(conn)
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -392,3 +426,7 @@ def set_settings(values: dict[str, str]):
 
 def rows(cur) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
+
+
+if __name__ == "__main__":
+    init_db()

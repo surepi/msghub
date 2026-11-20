@@ -39,7 +39,7 @@ from . import auth, media
 from .common import (DEFAULT_OFFLINE, DEFAULT_WELCOME, RateLimiter, in_work_hours, origin_allowed,
                      valid_contact)
 from .config import MAX_CONTACT, MAX_CONTENT, MAX_NAME
-from .db import ADMIN_MESSAGE_SQL, get_db, rows
+from .db import ADMIN_MESSAGE_SQL, begin_write, get_db, rows
 
 router = APIRouter()
 admin = Depends(auth.require_admin)
@@ -295,9 +295,9 @@ def add_message(conv_id: int, sender: str, content: str, page_url: str = "", msg
             )
         elif sender == "agent":
             db.execute(
-                "UPDATE conversations SET last_msg_at = ?, last_preview = ?, unread = 0, status = 'active', "
+                "UPDATE conversations SET last_msg_at = ?, last_preview = ?, unread = 0, read_upto = ?, status = 'active', "
                 "closed_at = NULL, ai_waiting_for_agent=0 WHERE id = ?",
-                (msg["created_at"], preview, conv_id),
+                (msg["created_at"], preview, msg["id"], conv_id),
             )
         elif sender == "ai":
             db.execute("UPDATE conversations SET last_msg_at = ?, last_preview = ? WHERE id = ?",
@@ -805,11 +805,6 @@ async def get_conversation(conv_id: int, message_id: int | None = Query(default=
             "SELECT id, content, created_at FROM conversation_notes WHERE conversation_id = ? ORDER BY id DESC LIMIT 100",
             (conv_id,),
         ))
-        if conv["unread"]:
-            db.execute("UPDATE conversations SET unread = 0 WHERE id = ?", (conv_id,))
-    if conv["unread"]:
-        conv = _require_conv(conv_id)
-        await hub.to_admins({"type": "conv", "conversation": conv})
     return {"conversation": conv, "visitor": visitor, "messages": window["items"], "notes": notes,
             "has_older": window["has_older"], "has_newer": window["has_newer"]}
 
@@ -912,13 +907,25 @@ def delete_quick_reply(reply_id: int):
     return {"ok": True}
 
 
+class ReadIn(BaseModel):
+    upto_id: int = Field(gt=0, le=9223372036854775807)
+
+
 @router.post("/api/admin/conversations/{conv_id}/read", tags=["对话"], dependencies=[admin])
-async def mark_read(conv_id: int):
-    _require_conv(conv_id)
+async def mark_read(conv_id: int, body: ReadIn):
+    upto = body.upto_id
     with get_db() as db:
-        changed = db.execute("UPDATE conversations SET unread = 0 WHERE id = ? AND unread > 0", (conv_id,)).rowcount
-    if changed:
-        await hub.to_admins({"type": "conv", "conversation": conv_summary(conv_id)})
+        begin_write(db)
+        if not db.execute("SELECT 1 FROM chat_messages WHERE conversation_id = ? AND id = ?", (conv_id, upto)).fetchone():
+            raise HTTPException(404, "消息不存在或不属于此会话")
+        changed = db.execute(
+            "UPDATE conversations SET read_upto = ?, unread = ("
+            "SELECT COUNT(*) FROM chat_messages WHERE conversation_id = ? AND sender = 'visitor' AND id > ?"
+            ") WHERE id = ? AND read_upto < ?",
+            (upto, conv_id, upto, conv_id, upto),
+        ).rowcount
+    if changed and (summary := conv_summary(conv_id)):
+        await hub.to_admins({"type": "conv", "conversation": summary})
     return {"ok": True}
 
 
