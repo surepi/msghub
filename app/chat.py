@@ -39,7 +39,7 @@ from . import auth, media
 from .common import (DEFAULT_OFFLINE, DEFAULT_WELCOME, RateLimiter, in_work_hours, origin_allowed,
                      valid_contact)
 from .config import MAX_CONTACT, MAX_CONTENT, MAX_NAME
-from .db import ADMIN_MESSAGE_SQL, begin_write, get_db, rows
+from .db import ADMIN_MESSAGE_SQL, GREATEST_SQL, NOW_SQL, DuplicateKeyError, begin_write, get_db, insert_once, rows
 
 router = APIRouter()
 admin = Depends(auth.require_admin)
@@ -68,7 +68,7 @@ class Hub:
     def __init__(self):
         self.visitors: dict[int, set[WebSocket]] = defaultdict(set)  # 会话 ID -> 访客连接（可能多个标签页）
         self.visitor_connections: dict[WebSocket, VisitorConnection] = {}
-        self.admins: set[WebSocket] = set()
+        self.admins: dict[WebSocket, str] = {}
 
     @staticmethod
     async def _send(ws: WebSocket, data: dict) -> bool:
@@ -95,9 +95,23 @@ class Hub:
         return sent and ws in self.visitor_connections
 
     async def to_admins(self, data: dict):
-        for ws in list(self.admins):
-            if not await self._send(ws, data):
-                self.admins.discard(ws)
+        for ws, token in list(self.admins.items()):
+            if not auth.verify_token(token):
+                await self._close_admin_socket(ws)
+            elif not await self._send(ws, data):
+                self.admins.pop(ws, None)
+
+    async def _close_admin_socket(self, ws: WebSocket):
+        if self.admins.pop(ws, None) is not None:
+            try:
+                await ws.close(4401)
+            except (RuntimeError, WebSocketDisconnect):
+                pass
+
+    async def close_admin(self, token: str):
+        for ws, current in list(self.admins.items()):
+            if current == token:
+                await self._close_admin_socket(ws)
 
     def visitor_online(self, conv_id: int) -> bool:
         return bool(self.visitors.get(conv_id))
@@ -174,8 +188,11 @@ CONV_SUMMARY_SQL = (
 
 
 def _msg_out(m: dict) -> dict:
-    return {"id": m["id"], "sender": m["sender"], "msg_type": m.get("msg_type") or "text",
-            "content": m["content"], "created_at": m["created_at"]}
+    result = {"id": m["id"], "sender": m["sender"], "msg_type": m.get("msg_type") or "text",
+              "content": m["content"], "created_at": m["created_at"]}
+    if result["msg_type"] == "image":
+        result["image_url"] = media.image_url(m["id"])
+    return result
 
 
 def preview_of(msg_type: str, content: str) -> str:
@@ -223,22 +240,22 @@ def get_site(site_id: int) -> dict | None:
     return dict(r) if r else None
 
 
-def find_visitor(token: str) -> dict | None:
+def find_visitor(site_id: int, token: str) -> dict | None:
     if not token:
         return None
     with get_db() as db:
-        r = db.execute("SELECT * FROM visitors WHERE token = ?", (token,)).fetchone()
+        r = db.execute("SELECT * FROM visitors WHERE token = ? AND site_id = ?", (token, site_id)).fetchone()
         if r:
-            db.execute("UPDATE visitors SET last_seen_at = datetime('now','localtime') WHERE id = ?", (r["id"],))
+            db.execute(f"UPDATE visitors SET last_seen_at = {NOW_SQL} WHERE id = ?", (r["id"],))
     return dict(r) if r else None
 
 
-def create_visitor(ip: str, ua: str, page: str) -> dict:
+def create_visitor(site_id: int, ip: str, ua: str, page: str) -> dict:
     token = "v_" + secrets.token_urlsafe(24)
     with get_db() as db:
         cur = db.execute(
-            "INSERT INTO visitors (token, ip, user_agent, first_page) VALUES (?,?,?,?)",
-            (token, ip, ua[:300], page[:500]),
+            "INSERT INTO visitors (token, site_id, ip, user_agent, first_page) VALUES (?,?,?,?,?)",
+            (token, site_id, ip, ua[:300], page[:500]),
         )
         return dict(db.execute("SELECT * FROM visitors WHERE id = ?", (cur.lastrowid,)).fetchone())
 
@@ -253,8 +270,8 @@ def find_conversation(site_id: int, visitor_id: int) -> dict | None:
 
 def get_or_create_conversation(site_id: int, visitor_id: int) -> dict:
     with get_db() as db:
-        db.execute(
-            "INSERT OR IGNORE INTO conversations (site_id, visitor_id) VALUES (?, ?)", (site_id, visitor_id)
+        insert_once(
+            db, "INSERT INTO conversations (site_id, visitor_id) VALUES (?, ?)", (site_id, visitor_id)
         )
         return dict(db.execute(
             "SELECT * FROM conversations WHERE site_id = ? AND visitor_id = ?", (site_id, visitor_id)
@@ -264,7 +281,7 @@ def get_or_create_conversation(site_id: int, visitor_id: int) -> dict:
 def history(conv_id: int, limit: int = HISTORY_LIMIT) -> list[dict]:
     with get_db() as db:
         items = rows(db.execute(
-            "SELECT * FROM (SELECT * FROM chat_messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?) "
+            "SELECT * FROM (SELECT * FROM chat_messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?) AS recent "
             "ORDER BY id",
             (conv_id, limit),
         ))
@@ -272,11 +289,13 @@ def history(conv_id: int, limit: int = HISTORY_LIMIT) -> list[dict]:
 
 
 def add_message(conv_id: int, sender: str, content: str, page_url: str = "", msg_type: str = "text", *,
-                db=None, queue_qq: bool = False) -> dict:
+                db=None, queue_qq: bool = False, upload_owner: str | None = None) -> dict:
     """写入一条消息并更新会话状态：
     访客消息 → 未读 +1，已结束的会话重新打开为 waiting；
     客服消息 → 未读清零，会话变为 active；AI / 系统消息不改状态。"""
     with (get_db() if db is None else nullcontext(db)) as db:
+        if upload_owner and not media.claim(db, content, upload_owner):
+            raise HTTPException(400, "图片无效，请重新上传")
         cur = db.execute(
             "INSERT INTO chat_messages (conversation_id, sender, content, msg_type, qq_state) "
             "VALUES (?,?,?,?,CASE WHEN ? AND EXISTS (SELECT 1 FROM qq_agent WHERE id=1 AND openid!='') "
@@ -288,8 +307,8 @@ def add_message(conv_id: int, sender: str, content: str, page_url: str = "", msg
         if sender == "visitor":
             db.execute(
                 "UPDATE conversations SET last_msg_at = ?, last_preview = ?, unread = unread + 1, "
-                "status = CASE WHEN status = 'closed' THEN 'waiting' ELSE status END, "
                 "closed_at = CASE WHEN status = 'closed' THEN NULL ELSE closed_at END, "
+                "status = CASE WHEN status = 'closed' THEN 'waiting' ELSE status END, "
                 "page_url = CASE WHEN ? != '' THEN ? ELSE page_url END WHERE id = ?",
                 (msg["created_at"], preview, page_url, page_url[:500], conv_id),
             )
@@ -312,9 +331,10 @@ async def broadcast_message(conv_id: int, msg: dict, client_id: str = ""):
         await hub.to_admins({"type": "msg", "conversation": summary, "message": msg})
 
 
-async def agent_reply(conv_id: int, content: str, msg_type: str = "text") -> tuple[dict, bool]:
+async def agent_reply(conv_id: int, content: str, msg_type: str = "text", *,
+                      upload_owner: str | None = None) -> tuple[dict, bool]:
     """客服回复（网页后台和 QQ 共用）。返回 (消息, 访客当前是否在线)。"""
-    msg = add_message(conv_id, "agent", content, msg_type=msg_type)
+    msg = add_message(conv_id, "agent", content, msg_type=msg_type, upload_owner=upload_owner)
     delivered = hub.visitor_online(conv_id)
     await broadcast_message(conv_id, msg)
     await hub.to_visitor(conv_id, {"type": "status", "status": "active"})
@@ -333,8 +353,8 @@ async def set_conversation_status(conv_id: int, status: str):
     with get_db() as db:
         if status == "closed":
             db.execute(
-                "UPDATE conversations SET status='closed', closed_at=datetime('now','localtime'), ai_waiting_for_agent=0, "
-                "auto_handled_upto=MAX(auto_handled_upto, COALESCE((SELECT MAX(id) FROM chat_messages "
+                f"UPDATE conversations SET status='closed', closed_at={NOW_SQL}, ai_waiting_for_agent=0, "
+                f"auto_handled_upto={GREATEST_SQL}(auto_handled_upto, COALESCE((SELECT MAX(id) FROM chat_messages "
                 "WHERE conversation_id=? AND sender='visitor'),0)) WHERE id=?",
                 (conv_id, conv_id),
             )
@@ -388,7 +408,7 @@ async def visitor_ws(ws: WebSocket):
     page_url = str(hello.get("page_url", ""))[:500]
 
     # 访客身份在填写资料或第一次发消息时才创建，只打开挂件不会产生数据
-    visitor = find_visitor(str(hello.get("token", "")))
+    visitor = find_visitor(site["id"], str(hello.get("token", "")))
     conv = find_conversation(site["id"], visitor["id"]) if visitor else None
 
     async def send(data: dict) -> bool:
@@ -401,7 +421,7 @@ async def visitor_ws(ws: WebSocket):
         if not _new_visitor_by_ip.allow(ip):
             await send({"type": "error", "error": "操作过于频繁，请稍后再试", "client_id": client_id})
             return False
-        visitor = create_visitor(ip, ua, page_url)
+        visitor = create_visitor(site["id"], ip, ua, page_url)
         return await send({"type": "token", "token": visitor["token"]})
 
     hub.track_visitor(ws, site)
@@ -431,6 +451,13 @@ async def visitor_ws(ws: WebSocket):
             if kind == "ping":
                 await send({"type": "pong"})
                 continue
+
+            current = get_site(site["id"])
+            if (not current or not current["enabled"] or current["site_key"] != site["site_key"]
+                    or not origin_allowed(current, ws.headers.get("origin", ""), ws.headers)):
+                hub.leave(ws)
+                return await fail("站点不存在或已停用", 4403)
+            site = current
 
             if kind == "profile":
                 name = str(data.get("name", "")).strip()[:MAX_NAME]
@@ -465,7 +492,6 @@ async def visitor_ws(ws: WebSocket):
             if len(content) > MAX_CONTENT:
                 await send({"type": "error", "error": f"单条消息不能超过 {MAX_CONTENT} 字", "client_id": client_id})
                 continue
-            site = find_site(site["site_key"]) or site   # 设置可能刚被修改
             if site.get("require_contact", 1) and not _profile_complete(visitor):
                 await send({"type": "error", "error": "请先填写称呼和联系方式", "client_id": client_id,
                             "need_profile": True})
@@ -481,7 +507,13 @@ async def visitor_ws(ws: WebSocket):
 
             msg_page = str(data.get("page_url", ""))[:500] or page_url
             was_closed = conv_summary(conv["id"])["status"] == "closed"
-            msg = add_message(conv["id"], "visitor", content, msg_page, msg_type, queue_qq=qq.ENABLED)
+            owner = f"visitor:{visitor['id']}" if msg_type == "image" else None
+            try:
+                msg = add_message(conv["id"], "visitor", content, msg_page, msg_type, queue_qq=qq.ENABLED,
+                                  upload_owner=owner)
+            except HTTPException as error:
+                await send({"type": "error", "error": error.detail, "client_id": client_id})
+                continue
             await broadcast_message(conv["id"], msg, client_id)
             if was_closed:
                 await hub.to_visitor(conv["id"], {"type": "status", "status": "waiting"})
@@ -514,21 +546,25 @@ async def admin_ws(ws: WebSocket):
     except Exception:
         await ws.close(4401)
         return
-    if not isinstance(first, dict) or first.get("type") != "auth" or not auth.verify_token(str(first.get("token", ""))):
+    token = str(first.get("token", "")) if isinstance(first, dict) and first.get("type") == "auth" else ""
+    if not auth.verify_token(token):
         await hub._send(ws, {"type": "error", "error": "未登录或登录已过期"})
         await ws.close(4401)
         return
-    hub.admins.add(ws)
+    hub.admins[ws] = token
     await hub._send(ws, {"type": "ready"})
     try:
-        while True:
-            data = await ws.receive_json()
+        while (seconds := auth.session_remaining(token)) > 0:
+            data = await asyncio.wait_for(ws.receive_json(), seconds)
             if isinstance(data, dict) and data.get("type") == "ping":
                 await hub._send(ws, {"type": "pong"})
+        await hub._close_admin_socket(ws)
+    except TimeoutError:
+        await hub._close_admin_socket(ws)
     except Exception:
         pass
     finally:
-        hub.admins.discard(ws)
+        hub.admins.pop(ws, None)
 
 
 # ---------------------------------------------------------------------------
@@ -546,8 +582,8 @@ def list_conversations(status: str | None = None, site_id: int | None = None,
     size = max(1, min(size, 100))
     page = max(1, page)
     q = q.strip()
-    # Treat wildcard characters as ordinary search text, and keep SQLite's ASCII case folding.
-    pattern = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    # Treat wildcard characters as ordinary search text on both backends.
+    pattern = "%" + q.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
     msg_where, msg_args = ["m.conversation_id = c.id"], []
     if date_from:
         msg_where.append("m.created_at >= ?")
@@ -558,7 +594,7 @@ def list_conversations(status: str | None = None, site_id: int | None = None,
     period_where = " AND ".join(msg_where)
     period_args = list(msg_args)
     if q:
-        msg_where.extend(["m.msg_type = 'text'", "m.content LIKE ? ESCAPE '\\'"])
+        msg_where.extend(["m.msg_type = 'text'", "LOWER(m.content) LIKE LOWER(?) ESCAPE '!'"])
         msg_args.append(pattern)
     match_where = " AND ".join(msg_where)
     where, args = [], []
@@ -585,7 +621,8 @@ def list_conversations(status: str | None = None, site_id: int | None = None,
         where.append(f"EXISTS (SELECT 1 FROM chat_messages m WHERE {period_where})")
         args.extend(period_args)
     if q:
-        cond = f"(v.name LIKE ? ESCAPE '\\' OR v.contact LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM chat_messages m WHERE {match_where})"
+        cond = (f"(LOWER(v.name) LIKE LOWER(?) ESCAPE '!' OR LOWER(v.contact) LIKE LOWER(?) ESCAPE '!' "
+                f"OR EXISTS (SELECT 1 FROM chat_messages m WHERE {match_where})")
         args.extend([pattern, pattern, *msg_args])
         number = q.removeprefix("#")
         if number.isascii() and number.isdigit() and int(number) <= 9223372036854775807:
@@ -699,7 +736,7 @@ def list_tags():
     with get_db() as db:
         return rows(db.execute(
             "SELECT t.id, t.name, COUNT(ct.conversation_id) AS conversation_count FROM tags t "
-            "LEFT JOIN conversation_tags ct ON ct.tag_id = t.id GROUP BY t.id ORDER BY t.id"
+            "LEFT JOIN conversation_tags ct ON ct.tag_id = t.id GROUP BY t.id, t.name ORDER BY t.id"
         ))
 
 
@@ -710,7 +747,7 @@ async def create_tag(body: TagIn):
         with get_db() as db:
             cur = db.execute("INSERT INTO tags (name) VALUES (?)", (name,))
             tag = {"id": cur.lastrowid, "name": name, "conversation_count": 0}
-    except sqlite3.IntegrityError:
+    except (sqlite3.IntegrityError, DuplicateKeyError):
         raise HTTPException(409, "已存在同名标签")
     await hub.to_admins({"type": "tags_changed"})
     return tag
@@ -723,7 +760,7 @@ async def rename_tag(tag_id: int, body: TagIn):
         with get_db() as db:
             if not db.execute("UPDATE tags SET name = ? WHERE id = ?", (name, tag_id)).rowcount:
                 raise HTTPException(404, "标签不存在")
-    except sqlite3.IntegrityError:
+    except (sqlite3.IntegrityError, DuplicateKeyError):
         raise HTTPException(409, "已存在同名标签")
     await hub.to_admins({"type": "tags_changed"})
     return {"ok": True}
@@ -749,7 +786,7 @@ async def _change_tags(conv_ids: list[int], tag_id: int, action: str) -> list[di
     marks = ",".join("?" for _ in conv_ids)
     with get_db() as db:
         # Validate and mutate in one transaction; invalid batches must change nothing.
-        db.execute("BEGIN IMMEDIATE")
+        begin_write(db)
         if not db.execute("SELECT 1 FROM tags WHERE id = ?", (tag_id,)).fetchone():
             raise HTTPException(404, "标签不存在")
         count = db.execute(f"SELECT COUNT(*) FROM conversations WHERE id IN ({marks})", conv_ids).fetchone()[0]
@@ -757,10 +794,11 @@ async def _change_tags(conv_ids: list[int], tag_id: int, action: str) -> list[di
             raise HTTPException(404, "部分会话已不存在，请刷新后重试")
         if action == "add":
             db.executemany("DELETE FROM conversation_ai_tag_blocks WHERE conversation_id=? AND tag_id=?", [(cid,tag_id) for cid in conv_ids])
-            db.executemany("INSERT OR IGNORE INTO conversation_tags (conversation_id, tag_id) VALUES (?, ?)",
-                           [(cid, tag_id) for cid in conv_ids])
+            for cid in conv_ids:
+                insert_once(db, "INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (?, ?)", (cid, tag_id))
         else:
-            db.executemany("INSERT OR IGNORE INTO conversation_ai_tag_blocks (conversation_id,tag_id) VALUES (?,?)", [(cid,tag_id) for cid in conv_ids])
+            for cid in conv_ids:
+                insert_once(db, "INSERT INTO conversation_ai_tag_blocks (conversation_id, tag_id) VALUES (?, ?)", (cid, tag_id))
             db.executemany("DELETE FROM conversation_tags WHERE conversation_id = ? AND tag_id = ?",
                            [(cid, tag_id) for cid in conv_ids])
         conversations = rows(db.execute(CONV_SUMMARY_SQL + f"WHERE c.id IN ({marks})", conv_ids))
@@ -857,12 +895,12 @@ def list_quick_replies(site_id: int | None = Query(default=None, gt=0)):
             return rows(db.execute(
                 "SELECT q.*, s.name AS site_name FROM quick_replies q "
                 "LEFT JOIN sites s ON s.id = q.site_id WHERE q.site_id IS NULL OR q.site_id = ? "
-                "ORDER BY q.site_id IS NOT NULL, q.title COLLATE NOCASE, q.id",
+                "ORDER BY q.site_id IS NOT NULL, LOWER(q.title), q.id",
                 (site_id,),
             ))
         return rows(db.execute(
             "SELECT q.*, s.name AS site_name FROM quick_replies q "
-            "LEFT JOIN sites s ON s.id = q.site_id ORDER BY q.site_id IS NOT NULL, q.title COLLATE NOCASE, q.id"
+            "LEFT JOIN sites s ON s.id = q.site_id ORDER BY q.site_id IS NOT NULL, LOWER(q.title), q.id"
         ))
 
 
@@ -890,7 +928,7 @@ def update_quick_reply(reply_id: int, body: QuickReplyIn):
         if site_id is not None and not db.execute("SELECT 1 FROM sites WHERE id = ?", (site_id,)).fetchone():
             raise HTTPException(404, "站点不存在")
         cur = db.execute(
-            "UPDATE quick_replies SET site_id = ?, title = ?, content = ?, updated_at = datetime('now','localtime') "
+            f"UPDATE quick_replies SET site_id = ?, title = ?, content = ?, updated_at = {NOW_SQL} "
             "WHERE id = ?",
             (site_id, title, content, reply_id),
         )
@@ -934,8 +972,8 @@ class ReplyIn(BaseModel):
     msg_type: str = "text"
 
 
-@router.post("/api/admin/conversations/{conv_id}/messages", tags=["对话"], dependencies=[admin])
-async def reply(conv_id: int, body: ReplyIn):
+@router.post("/api/admin/conversations/{conv_id}/messages", tags=["对话"])
+async def reply(conv_id: int, body: ReplyIn, token: str = admin):
     _require_conv(conv_id)
     content = body.content.strip()
     msg_type = "image" if body.msg_type == "image" else "text"
@@ -945,7 +983,8 @@ async def reply(conv_id: int, body: ReplyIn):
         raise HTTPException(400, "图片无效，请重新上传")
     if len(content) > MAX_CONTENT:
         raise HTTPException(400, f"单条消息不能超过 {MAX_CONTENT} 字")
-    msg, delivered = await agent_reply(conv_id, content, msg_type)
+    owner = media.admin_owner(token) if msg_type == "image" else None
+    msg, delivered = await agent_reply(conv_id, content, msg_type, upload_owner=owner)
     return {"message": msg, "delivered": delivered}
 
 

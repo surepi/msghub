@@ -26,9 +26,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import auth, auto, chat, media, qq_inbound
-from .config import (QQ_API_BASE, QQ_APP_ID, QQ_APP_SECRET, QQ_MERGE_DELAY, QQ_PASSIVE_MAX, QQ_PASSIVE_WINDOW,
-                     QQ_TOKEN_URL)
-from .db import get_db, rows
+from .config import (QQ_API_BASE, QQ_APP_ID, QQ_APP_SECRET, QQ_CALLBACK_KEY, QQ_CALLBACK_MAX_AGE,
+                     QQ_MERGE_DELAY, QQ_PASSIVE_MAX, QQ_PASSIVE_WINDOW, QQ_TOKEN_URL)
+from .db import begin_write, get_db, rows
+from .outbound import open_outbound
 
 router = APIRouter()
 admin = Depends(auth.require_admin)
@@ -78,9 +79,16 @@ def sign_validation(event_ts: str, plain_token: str, key: Ed25519PrivateKey | No
     return (key or _key).sign((event_ts + plain_token).encode()).hex()
 
 
+def _fresh_timestamp(timestamp: str) -> bool:
+    if not re.fullmatch(r"[0-9]{10}(?:[0-9]{3})?", timestamp):
+        return False
+    seconds = int(timestamp) / (1000 if len(timestamp) == 13 else 1)
+    return -60 <= time.time() - seconds <= QQ_CALLBACK_MAX_AGE
+
+
 def verify_event(timestamp: str, body: bytes, sig_hex: str, key: Ed25519PrivateKey | None = None) -> bool:
     """普通事件：校验 X-Signature-Ed25519 是否为 (X-Signature-Timestamp + 原始请求体) 的签名。"""
-    if not timestamp or not sig_hex:
+    if not _fresh_timestamp(timestamp) or not re.fullmatch(r"[0-9a-fA-F]{128}", sig_hex):
         return False
     try:
         sig = bytes.fromhex(sig_hex)
@@ -124,7 +132,7 @@ def _http(method: str, url: str, body: dict | None, headers: dict) -> tuple[int,
         headers={"Content-Type": "application/json", **headers},
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with open_outbound(req, timeout=10) as r:
             raw = r.read()
             status = r.status
     except urllib.error.HTTPError as e:
@@ -250,7 +258,7 @@ async def _send_one(openid: str, body: dict, conv_id: int | None) -> str:
         try:
             with get_db() as db:
                 for ref in filter(None, refs):
-                    db.execute("INSERT OR REPLACE INTO qq_forwards (qq_msg_id, conversation_id) VALUES (?, ?)",
+                    db.execute("REPLACE INTO qq_forwards (qq_msg_id, conversation_id) VALUES (?, ?)",
                                (str(ref), conv_id))
         except Exception as exc:
             raise QQSendUncertain('QQ 已响应，但本地引用记录保存失败，请先核对收件情况') from exc
@@ -461,7 +469,7 @@ def _download(url: str) -> bytes:
     elif not url.startswith(("http://", "https://")):
         url = "https://" + url
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 MsgHub"})
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with open_outbound(req, timeout=15, redirects=True) as r:
         data = r.read(media.MAX_IMAGE_BYTES + 1)
     if len(data) > media.MAX_IMAGE_BYTES:
         raise ValueError("图片超过 5MB")
@@ -528,7 +536,7 @@ async def _bind_from_inbound(openid: str, msg_id: str, code: str, inbound: dict)
     version = None
     async with queue_lock, _send_lock:
         with get_db() as db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_write(db)
             owner = db.execute("SELECT * FROM qq_agent WHERE id=1").fetchone()
             valid = (owner["binding_version"] == inbound["binding_version"] and owner["bind_code"]
                      and secrets.compare_digest(owner["bind_code"], code) and time.time() < owner["bind_expires"])
@@ -651,9 +659,10 @@ async def handle_c2c(d: dict, *, inbound: dict):
 # 平台回调
 # ---------------------------------------------------------------------------
 
-@router.post("/api/qq/callback", include_in_schema=False)
-async def callback(request: Request):
-    if not ENABLED:
+@router.post("/api/qq/callback/{callback_key}", include_in_schema=False)
+async def callback(request: Request, callback_key: str):
+    if (not ENABLED or not QQ_CALLBACK_KEY or not callback_key.isascii()
+            or not secrets.compare_digest(callback_key, QQ_CALLBACK_KEY)):
         raise HTTPException(404)
     body = await request.body()
     try:
@@ -668,10 +677,16 @@ async def callback(request: Request):
 
     op = payload.get("op")
     if op == 13:  # 回调地址校验
-        d = payload.get("d") or {}
-        plain = str(d.get("plain_token", ""))
+        d = payload.get("d")
+        if not isinstance(d, dict):
+            return JSONResponse({"error": "invalid challenge"}, 400)
+        plain = d.get("plain_token")
+        timestamp = str(d.get("event_ts", ""))
+        if (not isinstance(plain, str) or not re.fullmatch(r"[A-Za-z0-9_+/=.:\-]{1,512}", plain)
+                or not _fresh_timestamp(timestamp)):
+            return JSONResponse({"error": "invalid challenge"}, 400)
         log("收到回调地址校验请求")
-        return {"plain_token": plain, "signature": sign_validation(str(d.get("event_ts", "")), plain)}
+        return {"plain_token": plain, "signature": sign_validation(timestamp, plain)}
 
     if not verify_event(request.headers.get("x-signature-timestamp", ""), body,
                         request.headers.get("x-signature-ed25519", "")):
@@ -720,7 +735,7 @@ async def status():
         "app_id": QQ_APP_ID,
         "token_ok": token_ok,
         "token_error": token_error,
-        "callback_path": "/api/qq/callback",
+        "callback_path": f"/api/qq/callback/{QQ_CALLBACK_KEY}" if QQ_CALLBACK_KEY else "",
         "last_event_at": a["last_event_at"],
         "bound": bool(a["openid"]),
         "openid": _mask(a["openid"]),
@@ -752,7 +767,7 @@ async def unbind():
     from .qq_delivery import queue_lock, cancel_for_binding_change
     async with queue_lock, _send_lock:
         with get_db() as db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_write(db)
             version = db.execute("SELECT binding_version FROM qq_agent WHERE id=1").fetchone()[0]
             update_agent(db=db, openid="", bound_at=None, last_msg_id="", last_msg_at=0, passive_used=0,
                          current_conv_id=None, current_set_at=0, binding_version=version + 1, bind_code="", bind_expires=0)

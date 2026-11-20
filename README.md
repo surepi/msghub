@@ -18,20 +18,21 @@
 - **留言管理**：按站点 / 状态 / 关键词筛选，状态流转（未读 → 已读 → 已处理 / 垃圾），内部备注，批量操作，导出 CSV（Excel 可直接打开）
 - **防刷**：每 IP 频率限制、蜜罐字段过滤机器人、长度限制
 - **Webhook 推送**：新留言实时 POST 到你指定的地址（可对接企业微信 / 钉钉 / 飞书机器人中转、自有系统等）
-- **零外部依赖**：SQLite 单文件存储，前端无 CDN 依赖
+- **数据存储**：Docker 连接共享 MariaDB，本地开发默认使用 SQLite，前端无 CDN 依赖
 
 ## 部署（Docker）
 
-```bash
-cp .env.example .env      # 设置 ADMIN_PASSWORD
-docker compose up -d --build
-```
+首次部署和从旧版本升级都需先运行数据库迁移。迁移、反代、数据目录权限和 QQ 回调的操作顺序见
+[安全部署与升级](docs/SECURITY-DEPLOYMENT.md)。服务启动后打开 `http://127.0.0.1:20100`，
+用 `ADMIN_PASSWORD` 登录。
 
-打开 http://127.0.0.1:20100 ，用 `ADMIN_PASSWORD` 登录。
+Compose 加入外部 Docker 网络 `mariadb-shared`，通过 `mysql:3306` 连接共享 MariaDB。
+TCP 连接要求 TLS；同机 Docker 网络使用 MariaDB 生成的证书。本站的库名和运行账号均为
+`msghub`，密码由私有 `.env` 提供。
 
 > 网站访客的浏览器需要能访问 MsgHub，公网使用请放在 Nginx / Caddy 等 HTTPS 反向代理之后，
-> 并把 `.env` 中 `BIND_ADDR` 保持为 `127.0.0.1`。服务信任 `X-Forwarded-For` 来获取访客真实 IP，
-> 若直接暴露端口到公网，访客可伪造该请求头绕过 IP 频率限制。
+> 并把 `.env` 中 `BIND_ADDR` 保持为 `127.0.0.1`。在反代重建 `X-Forwarded-For`，
+> 并在 `FORWARDED_ALLOW_IPS` 中填实际连接到应用的可信代理地址。
 
 ### 反向代理需要支持 WebSocket
 
@@ -44,7 +45,7 @@ location / {
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
     proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-For $remote_addr;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_read_timeout 300s;
 }
@@ -52,14 +53,14 @@ location / {
 
 服务必须**单进程**运行（不要加 `--workers`）：在线连接保存在进程内存里。
 
-数据全部在 `./data`（`msghub.db` + `.secret`），备份这个目录即可。
+部署备份包含 MySQL 数据库和 `./data`，后者保存上传图片及本地生成的签名密钥。
 
 ## 对接 QQ 官方机器人
 
 客服只需一个 QQ：访客消息转发到 QQ，客服在 QQ 里回复，访客网页上实时看到。
 
-1. `.env` 填写 `QQ_APP_ID`、`QQ_APP_SECRET`（q.qq.com 机器人的开发设置），`docker compose up -d` 重启
-2. 后台「站点」页顶部的 QQ 卡片显示“凭据有效”后，复制其中的**回调地址**（`https://你的域名/api/qq/callback`），
+1. `.env` 填写 `QQ_APP_ID`、`QQ_APP_SECRET` 及独立生成的 `QQ_CALLBACK_KEY`，`docker compose up -d` 重建容器
+2. 后台「站点」页顶部的 QQ 卡片显示“凭据有效”后，复制其中的**回调地址**。该地址含回调凭据，请保密。
    填到 q.qq.com 的回调配置，订阅单聊消息事件。回调地址必须是 HTTPS，端口限 80 / 443 / 8080 / 8443
 3. 点「生成绑定码」，用客服的 QQ 给机器人发送 `/绑定 123456`，收到“绑定成功”即完成
 
@@ -140,7 +141,7 @@ ADMIN_PASSWORD=dev uvicorn app.main:app --reload --port 20100
 
 接口文档：http://127.0.0.1:20100/api/docs
 
-开发路线与进度：[docs/ROADMAP.md](docs/ROADMAP.md)。回归与浏览器验收：[docs/TESTING.md](docs/TESTING.md)。
+开发路线见 [ROADMAP.md](docs/ROADMAP.md)，回归见 [TESTING.md](docs/TESTING.md)，安全缺陷见 [BUGS.md](docs/BUGS.md)。
 
 ## 接入示例
 
@@ -154,6 +155,7 @@ ADMIN_PASSWORD=dev uvicorn app.main:app --reload --port 20100
 | `data-site-key` | 站点 Key，必填 |
 | `data-target` | 嵌入到页面中的某个容器（如 `#msghub`），不填则为右下角悬浮按钮 |
 | `data-mode` | `chat`（默认，在线对话）或 `form`（旧版留言表单） |
+| `data-lang` | `zh` 或 `en`。省略时跟随页面的 `<html lang>`（支持 `zh-CN`、`zh-Hans`、`en-US` 等），未声明或其他语言时默认中文。 |
 | `data-title` / `data-color` / `data-welcome` | 标题 / 主题色 / 欢迎语 |
 
 ```bash
@@ -196,7 +198,8 @@ msghub/
 │   ├── triage.py      # 私有会话分类、标签建议、优先级与持久化任务
 │   ├── media.py       # 图片上传与存储
 │   ├── common.py      # 限流、来源校验
-│   ├── db.py          # SQLite 表结构
+│   ├── db.py          # 数据库访问与 SQLite 表结构
+│   ├── mysql_schema.sql
 │   ├── auth.py        # 管理员登录令牌
 │   ├── config.py      # 配置
 │   └── static/        # 管理后台（index.html/admin.js/admin.css）与 embed.js 挂件

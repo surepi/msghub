@@ -4,6 +4,7 @@ Each run uses a temporary database and a separate Uvicorn process.
 No production configuration, QQ credentials or existing records are used.
 """
 import csv
+import http.client
 import io
 import json
 import os
@@ -54,7 +55,7 @@ class CustomerToolsTests(unittest.TestCase):
             port = sock.getsockname()[1]
         cls.base = f"http://127.0.0.1:{port}"
         cls.ws_base = f"ws://127.0.0.1:{port}"
-        env = dict(os.environ, DATA_DIR=cls.tmp.name, ADMIN_PASSWORD="test-only",
+        env = dict(os.environ, DATA_DIR=cls.tmp.name, ADMIN_PASSWORD="test-only", AI_ALLOW_LOOPBACK_HTTP="1",
                    SECRET_KEY="test-only", QQ_APP_ID="", QQ_APP_SECRET="")
         cls.env = env
         cls.server = subprocess.Popen(
@@ -138,6 +139,83 @@ class CustomerToolsTests(unittest.TestCase):
                 pass
             return self.request("GET", f"/api/admin/conversations?site_id={site['id']}")[1]["items"][0]
 
+    def test_logout_revokes_admin_api_and_live_connection(self):
+        from websockets.exceptions import ConnectionClosed
+
+        _, body = self.request("POST", "/api/admin/login", {"password": "test-only"}, authenticated=False)
+        token = body["token"]
+        headers = {"Authorization": "Bearer " + token}
+        with connect(self.ws_base + "/api/admin/ws") as ws:
+            ws.send(json.dumps({"type": "auth", "token": token}))
+            self.assertEqual(json.loads(ws.recv(timeout=3))["type"], "ready")
+            req = urllib.request.Request(self.base + "/api/admin/logout", headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=5) as response:
+                self.assertEqual(response.status, 204)
+            with self.assertRaises(ConnectionClosed):
+                ws.recv(timeout=3)
+        req = urllib.request.Request(self.base + "/api/admin/stats", headers=headers)
+        with self.assertRaises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(rejected.exception.code, 401)
+        rejected.exception.close()
+
+    def test_visitor_token_and_attachment_stay_with_their_owner(self):
+        site, other = self.sites
+        ws_url = self.ws_base + "/api/chat/ws"
+        image = b"\x89PNG\r\n\x1a\n" + b"image fixture"
+
+        def upload(key, token):
+            fields = {"site_key": key, "token": token}
+            body = b"".join(
+                f'--fixture\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+                for name, value in fields.items()
+            )
+            body += (b'--fixture\r\nContent-Disposition: form-data; name="file"; filename="photo.png"\r\n'
+                     b"Content-Type: image/png\r\n\r\n" + image + b"\r\n--fixture--\r\n")
+            req = urllib.request.Request(self.base + "/api/chat/upload", data=body,
+                                         headers={"Content-Type": "multipart/form-data; boundary=fixture"})
+            try:
+                response = urllib.request.urlopen(req, timeout=5)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                return response.status, json.load(response)
+
+        with connect(ws_url) as original, connect(ws_url) as unrelated:
+            original.send(json.dumps({"type": "hello", "site_key": site["site_key"]}))
+            self.assertEqual(json.loads(original.recv(timeout=3))["type"], "init")
+            original.send(json.dumps({"type": "profile", "name": "Visitor", "contact": "contact@example.com"}))
+            token = json.loads(original.recv(timeout=3))["token"]
+            self.assertEqual(json.loads(original.recv(timeout=3))["type"], "profile_ok")
+            unrelated.send(json.dumps({"type": "hello", "site_key": other["site_key"], "token": token}))
+            self.assertIsNone(json.loads(unrelated.recv(timeout=3))["profile"])
+            self.assertEqual(upload(other["site_key"], token)[0], 403)
+            status, staged = upload(site["site_key"], token)
+            self.assertEqual(status, 200)
+            with self.assertRaises(urllib.error.HTTPError) as hidden:
+                urllib.request.urlopen(self.base + staged["url"], timeout=5)
+            self.assertEqual(hidden.exception.code, 404)
+            hidden.exception.close()
+            original.send(json.dumps({"type": "msg", "msg_type": "image", "content": staged["url"]}))
+            event = json.loads(original.recv(timeout=3))
+            self.assertEqual(event["type"], "msg")
+            url = self.base + event["message"]["image_url"]
+            with urllib.request.urlopen(url, timeout=5) as response:
+                self.assertEqual(response.read(), image)
+                self.assertIn("no-store", response.headers["Cache-Control"])
+            original.send(json.dumps({"type": "msg", "msg_type": "image", "content": staged["url"]}))
+            self.assertEqual(json.loads(original.recv(timeout=3))["type"], "error")
+        with connect(ws_url) as restored:
+            restored.send(json.dumps({"type": "hello", "site_key": site["site_key"], "token": token}))
+            init = json.loads(restored.recv(timeout=3))
+            self.assertEqual(init["profile"]["name"], "Visitor")
+            conv_id = init["conversation"]["id"]
+        self.request("DELETE", f"/api/admin/conversations/{conv_id}")
+        with self.assertRaises(urllib.error.HTTPError) as removed:
+            urllib.request.urlopen(url, timeout=5)
+        self.assertEqual(removed.exception.code, 404)
+        removed.exception.close()
+
     def test_site_changes_revoke_only_affected_visitor_connections(self):
         from websockets.exceptions import ConnectionClosed
 
@@ -169,8 +247,8 @@ class CustomerToolsTests(unittest.TestCase):
         cid, _ = self.seed_search_conversation(site, messages=[(message, datetime.now().isoformat(sep=" "), "text")])
         with sqlite3.connect(Path(self.tmp.name) / "msghub.db") as db:
             token = db.execute(
-                "SELECT token FROM visitors WHERE id=(SELECT visitor_id FROM conversations WHERE id=?)",
-                (cid,),
+                "UPDATE visitors SET site_id=? WHERE id=(SELECT visitor_id FROM conversations WHERE id=?) RETURNING token",
+                (site["id"], cid),
             ).fetchone()[0]
         configure(f"{allowed},{removed}")
         with ExitStack() as sockets:
@@ -209,6 +287,36 @@ class CustomerToolsTests(unittest.TestCase):
             self.assertEqual(error["type"], "error")
             assert_revoked(disabled)
             assert_online(unaffected)
+
+    def test_submission_redirect_is_scoped_and_export_keeps_cells_as_text(self):
+        site_id = self.sites[0]["id"]
+        self.request("PUT", f"/api/admin/sites/{site_id}", {
+            "name": "Redirect tests", "allowed_origins": "https://shop.example.com",
+        })
+        data = {"site_key": self.sites[0]["site_key"], "_hp": "fixture", "content": "test"}
+        connection = http.client.HTTPConnection(self.base.removeprefix("http://"), timeout=5)
+        self.addCleanup(connection.close)
+        for target, expected in (("https://shop.example.com/thanks", 303),
+                                 ("https://other.example.com/thanks", 200)):
+            connection.request("POST", "/api/public/messages", json.dumps({**data, "_redirect": target}),
+                               {"Content-Type": "application/json"})
+            with connection.getresponse() as response:
+                self.assertEqual(response.status, expected)
+                self.assertEqual(response.headers.get("Location"), target if expected == 303 else None)
+                response.read()
+        connection.request("POST", "/api/public/messages", iter([b" " * (128 * 1024)] * 3),
+                           {"Content-Type": "application/json"}, encode_chunked=True)
+        with connection.getresponse() as response:
+            self.assertEqual(response.status, 413)
+            response.read()
+        note = "备注，中文\n带换行"
+        self.seed_inbox_message(site_id, content="=1+1", note=note)
+        headers = {"Authorization": "Bearer " + self.token}
+        req = urllib.request.Request(self.base + f"/api/admin/messages/export.csv?site_id={site_id}", headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            row = next(csv.DictReader(io.StringIO(response.read().decode("utf-8-sig"))))
+        self.assertEqual(row["内容"], "'=1+1")
+        self.assertEqual(row["备注"], note)
 
     def test_database_readiness_is_not_cached(self):
         with urllib.request.urlopen(self.base + "/api/ready", timeout=5) as response:
@@ -363,6 +471,7 @@ class CustomerToolsTests(unittest.TestCase):
         with sqlite3.connect(Path(self.tmp.name) / "msghub.db") as db:
             db.execute("UPDATE conversations SET unread=3 WHERE id=?", (cid,))
             visitor = db.execute("SELECT visitor_id FROM conversations WHERE id=?", (cid,)).fetchone()[0]
+            db.execute("UPDATE visitors SET site_id=? WHERE id=?", (site["id"], visitor))
             token = db.execute("SELECT token FROM visitors WHERE id=?", (visitor,)).fetchone()[0]
 
         def state():
@@ -392,12 +501,12 @@ class CustomerToolsTests(unittest.TestCase):
             migrate = [sys.executable, "-m", "app.db"]
             subprocess.run(migrate, env=env, check=True)
             with sqlite3.connect(Path(folder) / "msghub.db") as db:
-                db.execute("UPDATE settings SET value='1' WHERE key='read_cursor_version'")
+                db.execute("UPDATE settings SET value='1' WHERE key='schema_version'")
                 db.execute("ALTER TABLE conversations DROP COLUMN read_upto")
                 site = db.execute("INSERT INTO sites (name,site_key) VALUES ('Migration','migration')").lastrowid
                 expected = []
                 for unread in (0, 2, 5):
-                    visitor = db.execute("INSERT INTO visitors (token) VALUES (?)", (str(unread),)).lastrowid
+                    visitor = db.execute("INSERT INTO visitors (token,site_id) VALUES (?,?)", (str(unread), site)).lastrowid
                     cid = db.execute("INSERT INTO conversations (site_id,visitor_id,unread) VALUES (?,?,?)",
                                      (site, visitor, unread)).lastrowid
                     visitors = []
@@ -412,7 +521,7 @@ class CustomerToolsTests(unittest.TestCase):
                 subprocess.run(migrate, env=env, check=True)
                 with sqlite3.connect(Path(folder) / "msghub.db") as db:
                     self.assertEqual(db.execute("SELECT unread,read_upto FROM conversations ORDER BY id").fetchall(), expected)
-                    self.assertEqual(db.execute("SELECT value FROM settings WHERE key='read_cursor_version'").fetchone(), ("2",))
+                    self.assertEqual(db.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone(), ("2",))
 
     def seed_inbox_message(self, site_id, conv_id=None, content="Inbox entry", status="new", note="Private inbox note"):
         with sqlite3.connect(Path(self.tmp.name) / "msghub.db") as db:

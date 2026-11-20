@@ -4,41 +4,57 @@ import io
 import json
 import os
 import secrets
-import time
+from contextlib import asynccontextmanager
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import auth, auto, chat, media, qq, qq_delivery, summaries, triage
-from .common import RateLimiter, origin_allowed, parse_work_hours
+from .common import RateLimiter, http_origin, origin_allowed, parse_work_hours
 from .config import MAX_CONTACT, MAX_CONTENT, MAX_NAME, RATE_LIMIT_PER_MIN
-from .db import ADMIN_MESSAGE_SQL, STATUSES, get_db, init_db, rows
+from .db import ADMIN_MESSAGE_SQL, NOW_SQL, STATUSES, get_db, init_db, rows, since
+from .ingress import IngressLimits
+from .outbound import open_outbound
 
 STATIC = Path(__file__).parent / "static"
 
-app = FastAPI(title="MsgHub 留言汇", version="0.1.0", docs_url="/api/docs", redoc_url=None)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    qq.setup()     # 先注册 QQ 转发，再注册 AI / 转留言
+    auto.setup()
+    triage.setup()
+    cleanup = asyncio.create_task(media.cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup.cancel()
+        await asyncio.gather(cleanup, return_exceptions=True)
+
+
+app = FastAPI(title="MsgHub 留言汇", version="0.1.0", docs_url="/api/docs", redoc_url=None,
+              lifespan=lifespan)
+app.add_middleware(IngressLimits)
 
 
 @app.middleware("http")
 async def cache_headers(request: Request, call_next):
-    """页面和脚本每次都向服务器确认是否更新（未变化时返回 304），避免 CDN / 浏览器在部署后继续用旧版本；
-    上传的图片文件名随机且内容不变，长期缓存。"""
+    """页面和脚本每次都向服务器确认是否更新。"""
     response = await call_next(request)
     path = request.url.path
-    if path.startswith("/uploads/"):
-        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    if path.startswith(("/api/admin/", "/api/media/", "/uploads/")):
+        response.headers.setdefault("Cache-Control", "no-store")
     elif path in ("/", "/embed.js", "/favicon.ico") or path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
     return response
 
 
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
-app.mount("/uploads", StaticFiles(directory=media.UPLOAD_DIR), name="uploads")
 app.include_router(chat.router)
 app.include_router(media.router)
 app.include_router(qq.router)
@@ -46,14 +62,6 @@ app.include_router(qq_delivery.router)
 app.include_router(auto.router)
 app.include_router(summaries.router)
 app.include_router(triage.router)
-
-
-@app.on_event("startup")
-async def _startup():
-    init_db()
-    qq.setup()     # 先注册 QQ 转发，再注册 AI / 转留言
-    auto.setup()
-    triage.setup()
 
 
 @app.get("/api/health")
@@ -116,6 +124,7 @@ def favicon(request: Request):
 # ---------------------------------------------------------------------------
 
 _submit_limiter = RateLimiter(RATE_LIMIT_PER_MIN)
+_login_limiter = RateLimiter(10, window=300)
 
 
 def _client_ip(req: Request) -> str:
@@ -132,6 +141,17 @@ def _cors_headers(origin: str) -> dict:
     }
 
 
+def _return_url(site: dict, url: str) -> str:
+    target = http_origin(url)
+    if target is None:
+        return ""
+    domain = site["domain"].strip()
+    if domain and "://" not in domain:
+        domain = "https://" + domain
+    origins = [domain, *site["allowed_origins"].split(",")]
+    return url if target in {http_origin(origin.strip()) for origin in origins} else ""
+
+
 def _push_webhook(url: str, payload: dict):
     try:
         req = urllib.request.Request(
@@ -140,9 +160,9 @@ def _push_webhook(url: str, payload: dict):
             headers={"Content-Type": "application/json", "User-Agent": "MsgHub-Webhook/0.1"},
             method="POST",
         )
-        urllib.request.urlopen(req, timeout=8).close()
+        open_outbound(req, timeout=8).close()
     except Exception as e:  # noqa: BLE001
-        print(f"[webhook] 推送失败 {url}: {e}")
+        print(f"[webhook] 推送失败：{type(e).__name__}", flush=True)
 
 
 @app.options("/api/public/messages", include_in_schema=False)
@@ -162,12 +182,13 @@ async def public_submit(request: Request, bg: BackgroundTasks):
     if "application/json" in ctype:
         try:
             data = await request.json()
-        except Exception:
+        except ValueError:
             data = None
         if not isinstance(data, dict):
             raise HTTPException(400, "JSON 格式错误")
     else:
-        data = dict(await request.form())
+        async with request.form(max_files=0, max_fields=16, max_part_size=32 * 1024) as form:
+            data = dict(form)
 
     def fail(code: int, msg: str):
         return JSONResponse({"ok": False, "error": msg}, status_code=code, headers=_cors_headers(origin))
@@ -188,7 +209,7 @@ async def public_submit(request: Request, bg: BackgroundTasks):
     if not origin_allowed(site, origin, request.headers):
         return fail(403, "来源域名不被允许")
 
-    redirect = s("_redirect")
+    redirect = _return_url(site, s("_redirect"))
     if s("_hp"):  # 蜜罐被填写 -> 机器人，静默成功
         return RedirectResponse(redirect, 303) if redirect else JSONResponse({"ok": True}, headers=_cors_headers(origin))
 
@@ -214,8 +235,8 @@ async def public_submit(request: Request, bg: BackgroundTasks):
     with get_db() as db:
         cur = db.execute(
             "INSERT INTO messages (site_id,name,contact,content,page_url,ip,user_agent) "
-            "VALUES (:site_id,:name,:contact,:content,:page_url,:ip,:user_agent)",
-            msg,
+            "VALUES (?,?,?,?,?,?,?)",
+            tuple(msg[key] for key in ("site_id", "name", "contact", "content", "page_url", "ip", "user_agent")),
         )
         msg["id"] = cur.lastrowid
 
@@ -224,7 +245,7 @@ async def public_submit(request: Request, bg: BackgroundTasks):
     if site["webhook_url"]:
         bg.add_task(_push_webhook, site["webhook_url"], {"event": "message.created", "site": site["name"], **msg})
 
-    if redirect and urlparse(redirect).scheme in ("http", "https"):
+    if redirect:
         return RedirectResponse(redirect, 303)
     return JSONResponse({"ok": True, "id": msg["id"]}, headers=_cors_headers(origin))
 
@@ -234,13 +255,14 @@ async def public_submit(request: Request, bg: BackgroundTasks):
 # ---------------------------------------------------------------------------
 
 class LoginIn(BaseModel):
-    password: str
+    password: str = Field(max_length=1024)
 
 
 @app.post("/api/admin/login", tags=["管理"])
-def login(body: LoginIn):
+def login(request: Request, body: LoginIn):
+    if not _login_limiter.allow(_client_ip(request)):
+        raise HTTPException(429, "登录尝试过于频繁，请稍后再试", {"Retry-After": "300"})
     if not auth.check_password(body.password):
-        time.sleep(1)
         raise HTTPException(401, "密码错误")
     return {"token": auth.issue_token()}
 
@@ -248,11 +270,17 @@ def login(body: LoginIn):
 admin = Depends(auth.require_admin)
 
 
+@app.post("/api/admin/logout", tags=["管理"], status_code=204)
+async def logout(token: str = admin):
+    auth.revoke_token(token)
+    await chat.hub.close_admin(token)
+
+
 @app.get("/api/admin/stats", tags=["管理"], dependencies=[admin])
 def stats():
     with get_db() as db:
         by_status = {r["status"]: r["c"] for r in db.execute("SELECT status, COUNT(*) c FROM messages GROUP BY status")}
-        today = db.execute("SELECT COUNT(*) FROM messages WHERE date(created_at) = date('now','localtime')").fetchone()[0]
+        today = db.execute(f"SELECT COUNT(*) FROM messages WHERE date(created_at) = date({NOW_SQL})").fetchone()[0]
         sites = db.execute("SELECT COUNT(*) FROM sites").fetchone()[0]
         conv_open, conv_waiting, conv_unread = db.execute(
             "SELECT COUNT(*), COALESCE(SUM(status = 'waiting'), 0), COALESCE(SUM(unread > 0), 0) "
@@ -260,7 +288,7 @@ def stats():
         ).fetchone()
         trend = rows(db.execute(
             "SELECT date(created_at) d, COUNT(*) c FROM messages "
-            "WHERE created_at >= date('now','localtime','-13 days') GROUP BY d ORDER BY d"
+            "WHERE created_at >= ? GROUP BY d ORDER BY d", (since(days=13)[:10] + " 00:00:00",),
         ))
     return {
         "total": sum(by_status.values()),
@@ -297,13 +325,16 @@ SITE_FIELDS = ("name", "domain", "allowed_origins", "webhook_url", "enabled", "w
 def _site_values(body: SiteIn) -> list:
     if not body.name.strip():
         raise HTTPException(400, "站点名称不能为空")
+    webhook = body.webhook_url.strip()
+    if webhook and (not (origin := http_origin(webhook)) or origin[0] != "https"):
+        raise HTTPException(400, "Webhook 需要有效的 HTTPS 地址")
     wh = ""
     if body.work_hours:
         wh = json.dumps(body.work_hours, ensure_ascii=False)
         if not parse_work_hours(wh) or not parse_work_hours(wh)["days"]:
             raise HTTPException(400, "工作时间格式不正确：至少选一天，时间为 HH:MM")
         wh = json.dumps(parse_work_hours(wh), ensure_ascii=False)
-    return [body.name.strip(), body.domain.strip(), body.allowed_origins.strip(), body.webhook_url.strip(),
+    return [body.name.strip(), body.domain.strip(), body.allowed_origins.strip(), webhook,
             int(body.enabled), body.welcome.strip()[:500], body.offline_text.strip()[:500], wh,
             int(body.require_contact), int(body.ai_enabled), body.crawl_urls.strip()[:2000]]
 
@@ -374,8 +405,11 @@ def _msg_filter(site_id: int | None, status: str | None, q: str | None, *, befor
     if status:
         where.append("m.status = ?"); args.append(status)
     if q:
-        where.append("(m.content LIKE ? OR m.name LIKE ? OR m.contact LIKE ?)")
-        args += [f"%{q}%"] * 3
+        where.append(
+            "(LOWER(m.content) LIKE LOWER(?) ESCAPE '!' OR LOWER(m.name) LIKE LOWER(?) ESCAPE '!' "
+            "OR LOWER(m.contact) LIKE LOWER(?) ESCAPE '!')"
+        )
+        args += ["%" + q.replace("!", "!!") + "%"] * 3
     if before_id is not None:
         where.append("m.id < ?")
         args.append(before_id)
@@ -409,7 +443,7 @@ async def mark_message_read(msg_id: int):
         message = db.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
         if not message:
             raise HTTPException(404, "留言不存在")
-        changed = db.execute("UPDATE messages SET status = 'read', updated_at = datetime('now','localtime') WHERE id = ? AND status = 'new'", (msg_id,)).rowcount
+        changed = db.execute(f"UPDATE messages SET status = 'read', updated_at = {NOW_SQL} WHERE id = ? AND status = 'new'", (msg_id,)).rowcount
         current = db.execute("SELECT status FROM messages WHERE id = ?", (msg_id,)).fetchone()[0]
     if changed:
         await chat.hub.to_admins({"type": "inbox_changed", "conversation_ids": [message[0]] if message[0] else []})
@@ -427,7 +461,7 @@ async def patch_message(msg_id: int, body: MsgPatch):
         sets.append("note=?"); args.append(body.note[:2000])
     if not sets:
         return {"ok": True}
-    sets.append("updated_at=datetime('now','localtime')")
+    sets.append(f"updated_at={NOW_SQL}")
     with get_db() as db:
         source = db.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
         if not db.execute(f"UPDATE messages SET {', '.join(sets)} WHERE id=?", [*args, msg_id]).rowcount:
@@ -452,7 +486,7 @@ async def batch_messages(body: BatchIn):
             n = db.execute(f"DELETE FROM messages WHERE id IN ({marks})", body.ids).rowcount
         elif body.action in STATUSES:
             n = db.execute(
-                f"UPDATE messages SET status=?, updated_at=datetime('now','localtime') WHERE id IN ({marks})",
+                f"UPDATE messages SET status=?, updated_at={NOW_SQL} WHERE id IN ({marks})",
                 [body.action, *body.ids],
             ).rowcount
         else:

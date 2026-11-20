@@ -4,9 +4,10 @@ const assert = require("node:assert/strict");
 const base = "http://127.0.0.1:20101";
 const engine = { chromium, firefox, webkit }[process.env.MSGHUB_BROWSER || "chromium"];
 
-async function mountWidget(page, key, form = false) {
+async function mountWidget(page, key, { form = false, lang } = {}) {
   await page.goto(base);
-  await page.evaluate(({ key, form }) => {
+  await page.evaluate(({ key, form, lang }) => {
+    if (lang) document.documentElement.lang = lang;
     const host = document.createElement("div");
     host.id = "widgetTest";
     document.body.appendChild(host);
@@ -18,7 +19,7 @@ async function mountWidget(page, key, form = false) {
       script.dataset.target = "#widgetTest";
     }
     document.head.appendChild(script);
-  }, { key, form });
+  }, { key, form, lang });
 }
 
 (async () => {
@@ -175,12 +176,16 @@ async function mountWidget(page, key, form = false) {
 
     const formPage = await browser.newPage();
     await formPage.route("**/api/public/messages", route => route.fulfill({ status: 502, body: "unavailable" }));
-    await mountWidget(formPage, site.site_key, true);
+    await mountWidget(formPage, site.site_key, { form: true });
     await formPage.locator(".mh-form textarea").fill("提交失败时保留文字");
     await formPage.locator(".mh-form button").click();
     await expect(formPage.locator(".mh-tip")).toContainText("服务暂不可用");
     await expect(formPage.locator(".mh-form textarea")).toHaveValue("提交失败时保留文字");
     await expect(formPage.locator(".mh-form button")).toBeEnabled();
+    await formPage.evaluate(() => { document.documentElement.lang = "en-GB"; });
+    await expect(formPage.locator(".mh-tip")).toContainText("Service temporarily unavailable");
+    await expect(formPage.locator(".mh-form button")).toHaveText("Submit message");
+    await expect(formPage.locator(".mh-form textarea")).toHaveValue("提交失败时保留文字");
     const changed = await api.put("/api/admin/sites/" + site.id, {
       headers, data: { name: site.name, require_contact: true, ai_enabled: false }
     });
@@ -206,7 +211,8 @@ async function mountWidget(page, key, form = false) {
         if (msg.type === "hello") {
           socket.send(JSON.stringify({
             type: "init",
-            site: { ai_available: true, online: false, offline_text: "非工作时间", require_contact: false },
+            site: { ai_available: true, online: false, welcome: "您好，请问有什么可以帮您？",
+              offline_text: "非工作时间", require_contact: false },
             conversation: null, messages: []
           }));
         } else if (msg.type === "msg") {
@@ -216,13 +222,39 @@ async function mountWidget(page, key, form = false) {
         }
       });
     });
-    await mountWidget(assistantPage, site.site_key);
-    await assistantPage.locator(".mh-fab").click();
-    await expect(assistantPage.locator(".mh-head small")).toContainText("AI 助手可接待");
+    await mountWidget(assistantPage, site.site_key, { lang: "en-US" });
+    const assistantLauncher = assistantPage.getByRole("button", { name: "Open live chat" });
+    await expect(assistantLauncher).toHaveAttribute("title", "Open live chat");
+    await expect(assistantLauncher.locator(".mh-glyph-chat")).toHaveAttribute("aria-hidden", "true");
+    await assistantLauncher.click();
+    const closeChat = assistantPage.getByRole("button", { name: "Close live chat" });
+    await expect(closeChat).toHaveAttribute("title", "Close live chat");
+    await expect(closeChat.locator(".mh-glyph-close")).toBeVisible();
+    await expect(assistantPage.locator(".mh-head small")).toContainText("AI assistant available");
+    await expect(assistantPage.locator(".mh-list")).toContainText("Hello! How can we help you?");
     await expect(assistantPage.locator(".mh-off")).toBeHidden();
-    await assistantPage.locator(".mh-foot textarea").fill("你好");
+    const uploader = assistantPage.getByRole("button", { name: "Upload image" });
+    await expect(uploader).toHaveAttribute("title", "Upload image");
+    await expect(uploader.locator(".mh-glyph-upload")).toBeVisible();
+    const assistantComposer = assistantPage.locator(".mh-foot textarea");
+    await assistantComposer.focus();
+    assert(await assistantComposer.evaluate(input => {
+      const style = getComputedStyle(input);
+      const canvas = document.createElement("canvas").getContext("2d");
+      canvas.font = style.fontSize + " " + style.fontFamily;
+      const available = input.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      return canvas.measureText(input.placeholder).width <= available;
+    }), "English placeholder fits the composer at 320px");
+    await assistantComposer.fill("你好");
     await assistantPage.locator(".mh-foot .mh-btn").click();
     await expect(assistantPage.locator(".mh-thinking")).toBeVisible();
+    await assistantComposer.fill("Still typing");
+    await assistantPage.evaluate(() => { document.documentElement.lang = "zh-Hans"; });
+    await expect(assistantPage.locator(".mh-fab")).toHaveAttribute("aria-label", "关闭咨询窗口");
+    await expect(assistantPage.locator(".mh-thinking")).toContainText("AI 助手正在查看您的消息");
+    await expect(assistantPage.locator(".mh-list")).toContainText("您好，请问有什么可以帮您？");
+    await expect(assistantPage.locator(".mh-list .me")).toHaveText("你好");
+    await expect(assistantComposer).toHaveValue("Still typing");
     assistantSocket.send(JSON.stringify({ type: "ai_status", thinking: false, handoff: true }));
     await expect(assistantPage.locator(".mh-thinking")).toBeHidden();
     await expect(assistantPage.locator(".mh-head small")).toContainText("等待人工客服");

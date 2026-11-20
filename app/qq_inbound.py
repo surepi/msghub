@@ -6,7 +6,7 @@ import json
 import time
 
 from . import chat
-from .db import get_db
+from .db import NOW_SQL, begin_write, get_db, insert_once
 
 MAX_ATTEMPTS = 5
 _wake: asyncio.Event | None = None
@@ -17,15 +17,15 @@ def accept(app_id: str, event_id: str, payload: dict) -> None:
     identity = str(payload.get("id") or event_id) or body
     key = hashlib.sha256(f"{app_id}\0{identity}".encode()).hexdigest()
     with get_db() as db:
-        db.execute(
+        insert_once(
+            db,
             "INSERT INTO qq_inbound "
             "(event_key,app_id,payload,received_at,binding_version,default_conv_id,default_set_at) "
             "SELECT ?,?,?,?,binding_version,CASE WHEN EXISTS (SELECT 1 FROM qq_deliveries WHERE status='sending') "
-            "THEN NULL ELSE current_conv_id END,current_set_at FROM qq_agent WHERE id=1 "
-            "ON CONFLICT(event_key) DO NOTHING",
+            "THEN NULL ELSE current_conv_id END,current_set_at FROM qq_agent WHERE id=1",
             (key, app_id, body, time.time()),
         )
-        db.execute("UPDATE qq_agent SET last_event_at=datetime('now','localtime') WHERE id=1")
+        db.execute(f"UPDATE qq_agent SET last_event_at={NOW_SQL} WHERE id=1")
     if _wake is not None:
         _wake.set()
 
@@ -33,7 +33,7 @@ def accept(app_id: str, event_id: str, payload: dict) -> None:
 def pin_reply(event: dict, target: int, implicit: bool) -> None:
     with get_db() as db:
         db.execute(
-            "UPDATE qq_inbound SET target_conv_id=?,implicit=? WHERE id=? AND status='pending'",
+            "UPDATE qq_inbound SET target_conv_id=?,`implicit`=? WHERE id=? AND status='pending'",
             (target, implicit, event["id"]),
         )
 
@@ -42,7 +42,7 @@ def commit_reply(event: dict, openid: str, target: int, implicit: bool,
                  contents: list[tuple[str, str]]) -> tuple[list[dict], str]:
     """Commit the full reply and its receipt together before broadcasting."""
     with get_db() as db:
-        db.execute("BEGIN IMMEDIATE")
+        begin_write(db)
         receipt = db.execute("SELECT status FROM qq_inbound WHERE id=?", (event["id"],)).fetchone()
         if not receipt or receipt["status"] != "pending":
             return [], ""

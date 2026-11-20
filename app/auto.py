@@ -6,6 +6,7 @@ conversation. Sites without AI still archive unanswered messages on the existing
 import asyncio
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -19,8 +20,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from . import auth, chat
-from .common import DEFAULT_OFFLINE, in_work_hours
-from .db import get_db, get_setting, rows, set_settings
+from .common import DEFAULT_OFFLINE, RateLimiter, http_origin, in_work_hours
+from .config import AI_ALLOW_LOOPBACK_HTTP, AI_CALLS_PER_HOUR
+from .db import MYSQL, NOW_SQL, begin_write, get_db, get_setting, rows, set_settings, since
+from .outbound import open_outbound
 
 router = APIRouter()
 admin = Depends(auth.require_admin)
@@ -40,6 +43,8 @@ CRAWL_INTERVAL = 24 * 3600
 PAGE_TEXT_LIMIT = 20000
 CHUNK = 400
 UA = "MsgHub-Crawler/1.0"
+_ai_budget = RateLimiter(AI_CALLS_PER_HOUR, window=3600)
+_ai_slots = threading.BoundedSemaphore(4)
 
 
 def log(text: str):
@@ -178,14 +183,25 @@ def _completion(base_url: str, api_key: str, model: str, messages: list[dict], t
     body = json.dumps({"model": model, "messages": messages, "temperature": 0.3, "max_tokens": 800}).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Content-Type": "application/json", "Authorization": "Bearer " + api_key})
+    if not _ai_slots.acquire(blocking=False):
+        raise AIError("AI 服务并发已满")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read())
+        if not _ai_budget.allow("provider"):
+            raise AIError("AI 服务已达到每小时调用上限")
+        with open_outbound(req, timeout=timeout, loopback_test=AI_ALLOW_LOOPBACK_HTTP) as r:
+            raw = r.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                raise AIError("AI 服务响应过大")
+            data = json.loads(raw)
     except urllib.error.HTTPError as e:
-        detail = e.read()[:300].decode(errors="replace")
-        raise AIError(f"HTTP {e.code}：{detail}")
+        e.close()
+        raise AIError(f"HTTP {e.code}") from None
+    except AIError:
+        raise
     except Exception as e:  # noqa: BLE001
-        raise AIError(f"请求失败：{e}")
+        raise AIError("AI 服务请求失败") from e
+    finally:
+        _ai_slots.release()
     try:
         return str(data["choices"][0]["message"]["content"] or "").strip()
     except (KeyError, IndexError, TypeError):
@@ -242,7 +258,7 @@ def save_decision(db, conv_id, upto, trigger, question, answer, reason_code, evi
     origin = '模型回答' if reason_code == 'answered' else '模型分类' if reason_code in ('insufficient_sources','visitor_requested','human_required','model_handoff') else '系统状态'
     sources = evidence.get('sources', [])
     return db.execute(
-        'INSERT INTO ai_decisions (conversation_id,source_upto,message_id,inbox_message_id,qq_delivery_id,outcome,trigger,reason_code,reason,reason_origin,model,question,question_truncated,answer,context,sources,source_count) '
+        'INSERT INTO ai_decisions (conversation_id,source_upto,message_id,inbox_message_id,qq_delivery_id,outcome,`trigger`,reason_code,reason,reason_origin,model,question,question_truncated,answer,context,sources,source_count) '
         'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         (conv_id,upto,message_id,inbox_id,delivery_id,outcome,trigger,reason_code,REASONS[reason_code],origin,
          evidence.get('model','')[:200],question[:6000],int(len(question)>6000),answer[:5000],evidence.get('context',''),json.dumps(sources,ensure_ascii=False),len(sources))).lastrowid
@@ -268,7 +284,7 @@ def list_decisions(conv_id: int, page: int = Query(default=1,ge=1,le=1000000), s
                 raise HTTPException(404,'投递记录不存在或不属于此会话')
             where += ' AND qq_delivery_id=?'; args.append(delivery_id)
         total = db.execute('SELECT COUNT(*) FROM ai_decisions WHERE '+where,args).fetchone()[0]
-        items = rows(db.execute('SELECT id,conversation_id,message_id,qq_delivery_id,inbox_message_id,outcome,trigger,reason_code,reason,reason_origin,model,source_count,created_at '
+        items = rows(db.execute('SELECT id,conversation_id,message_id,qq_delivery_id,inbox_message_id,outcome,`trigger`,reason_code,reason,reason_origin,model,source_count,created_at '
                                 'FROM ai_decisions WHERE '+where+' ORDER BY id DESC LIMIT ? OFFSET ?',(*args,size,(page-1)*size)))
     return {'items':items,'total':total,'page':page,'size':size}
 
@@ -318,9 +334,9 @@ def archive(db, conv: dict, msgs: list[dict], note: str):
     v = db.execute("SELECT * FROM visitors WHERE id = ?", (conv["visitor_id"],)).fetchone()
     existing = db.execute(
         "SELECT id, content FROM messages WHERE conversation_id = ? AND status = 'new' "
-        "AND created_at >= datetime('now','localtime','-1 day') ORDER BY id DESC LIMIT 1", (conv["id"],)).fetchone()
+        "AND created_at >= ? ORDER BY id DESC LIMIT 1", (conv["id"], since(days=1))).fetchone()
     if existing:
-        db.execute("UPDATE messages SET content = ?, updated_at = datetime('now','localtime') WHERE id = ?",
+        db.execute(f"UPDATE messages SET content = ?, updated_at = {NOW_SQL} WHERE id = ?",
                    (existing["content"] + "\n\n" + text, existing["id"]))
         return existing['id']
     return db.execute(
@@ -332,10 +348,10 @@ def archive(db, conv: dict, msgs: list[dict], note: str):
 def _recent_notice(db, conv_id: int) -> bool:
     return bool(db.execute(
         "SELECT 1 FROM chat_messages WHERE conversation_id=? AND sender='system' "
-        "AND created_at >= datetime('now','localtime', ?) "
+        "AND created_at >= ? "
         "AND id > COALESCE((SELECT MAX(id) FROM chat_messages WHERE conversation_id=? "
         "AND sender='system' AND content=?),0) LIMIT 1",
-        (conv_id, f"-{NOTICE_COOLDOWN // 60} minutes", conv_id, chat.CONVERSATION_CLOSED_TEXT)
+        (conv_id, since(minutes=NOTICE_COOLDOWN // 60), conv_id, chat.CONVERSATION_CLOSED_TEXT)
     ).fetchone())
 
 
@@ -441,7 +457,7 @@ async def handle_unattended(conv_id: int, reason: str):
         from . import qq_delivery
         delivery_id, inbox_id, ai_message, notice = None, None, None, None
         with get_db() as db:
-            db.execute('BEGIN IMMEDIATE')
+            begin_write(db)
             state = db.execute(
                 "SELECT c.status,c.auto_handled_upto,s.enabled,s.ai_enabled FROM conversations c "
                 "JOIN sites s ON s.id=c.site_id WHERE c.id=?", (conv_id,)).fetchone()
@@ -553,9 +569,8 @@ async def _recover_ai_loop():
             with get_db() as db:
                 recent = [row[0] for row in db.execute(
                     _WAITING_MESSAGES + " AND c.status='waiting' AND (s.ai_enabled=1 OR c.ai_waiting_for_agent=1) "
-                    "AND m.created_at >= datetime('now','localtime','-2 minutes') "
-                    "GROUP BY c.id HAVING latest_at <= datetime('now','localtime', ?) ORDER BY latest_at LIMIT 100",
-                    (f"-{MERGE_SECONDS + 1} seconds",))]
+                    "AND m.created_at >= ? GROUP BY c.id HAVING MAX(m.created_at) <= ? ORDER BY latest_at LIMIT 100",
+                    (since(minutes=2), since(seconds=MERGE_SECONDS + 1)))]
             for cid in recent:
                 _schedule(cid, "ai_first", 0)
         except Exception as exc:
@@ -569,8 +584,8 @@ async def _timeout_loop():
             settings = ai_settings()
             with get_db() as db:
                 pending = rows(db.execute(
-                    _WAITING_MESSAGES + " GROUP BY c.id HAVING MIN(m.created_at)<=datetime('now','localtime', ?) LIMIT 100",
-                    (f"-{settings['no_reply_minutes']} minutes",)))
+                    _WAITING_MESSAGES + " GROUP BY c.id HAVING MIN(m.created_at)<=? LIMIT 100",
+                    (since(minutes=settings['no_reply_minutes']),)))
             for row in pending:
                 _schedule(row["id"], "timeout_archive", 0)
         except Exception as exc:
@@ -621,10 +636,10 @@ class _PageParser(HTMLParser):
 _SKIP_EXT = re.compile(r"\.(pdf|jpe?g|png|gif|webp|svg|zip|rar|7z|gz|mp4|mp3|avi|mov|exe|dmg|apk|doc|docx|xls|xlsx|ppt|pptx|css|js|ico|woff2?)$", re.I)
 
 
-def _fetch(url: str) -> tuple[str, str, bytes]:
+def _fetch(url: str, hosts: set[str]) -> tuple[str, str, bytes]:
     """返回 (最终 URL, content-type, 内容)。"""
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html,*/*;q=0.5"})
-    with urllib.request.urlopen(req, timeout=10) as r:
+    with open_outbound(req, timeout=10, https_only=False, redirects=True, allowed_hosts=hosts) as r:
         return r.geturl(), r.headers.get("Content-Type", ""), r.read(CRAWL_MAX_BYTES)
 
 
@@ -643,7 +658,7 @@ def crawl_starts(site: dict) -> list[str]:
     if not starts and site.get("domain"):
         d = site["domain"].strip()
         starts = [d if d.startswith("http") else f"https://{d}/"]
-    return [u for u in starts if urllib.parse.urlparse(u).scheme in ("http", "https")]
+    return [u for u in starts if http_origin(u)]
 
 
 def crawl(site: dict) -> dict:
@@ -651,7 +666,7 @@ def crawl(site: dict) -> dict:
     starts = crawl_starts(site)
     if not starts:
         return {"ok": False, "error": "没有可抓取的地址：请在站点设置中填写域名或抓取起始地址"}
-    hosts = {urllib.parse.urlparse(u).netloc for u in starts}
+    hosts = {http_origin(u)[1] for u in starts}
     robots: dict[str, urllib.robotparser.RobotFileParser] = {}
 
     def allowed(url: str) -> bool:
@@ -660,7 +675,7 @@ def crawl(site: dict) -> dict:
         if rp is None:
             rp = urllib.robotparser.RobotFileParser()
             try:
-                _, _, raw = _fetch(f"{p.scheme}://{p.netloc}/robots.txt")
+                _, _, raw = _fetch(f"{p.scheme}://{p.netloc}/robots.txt", hosts)
                 rp.parse(raw.decode(errors="replace").splitlines())
             except Exception:
                 rp.parse([])
@@ -674,7 +689,7 @@ def crawl(site: dict) -> dict:
         if not allowed(url):
             continue
         try:
-            final, ctype, raw = _fetch(url)
+            final, ctype, raw = _fetch(url, hosts)
         except Exception as exc:
             if isinstance(exc, urllib.error.HTTPError):
                 if exc.code in (404, 410):
@@ -695,8 +710,9 @@ def crawl(site: dict) -> dict:
         if depth < CRAWL_MAX_DEPTH:
             for href in parser.links:
                 link = urllib.parse.urljoin(final, href).split("#")[0]
-                p = urllib.parse.urlparse(link)
-                if p.scheme in ("http", "https") and p.netloc in hosts and link not in seen and not _SKIP_EXT.search(p.path):
+                origin = http_origin(link)
+                if (origin and origin[1] in hosts and link not in seen
+                        and not _SKIP_EXT.search(urllib.parse.urlsplit(link).path)):
                     seen.add(link)
                     queue.append((link, depth + 1))
         time.sleep(0.3)
@@ -771,8 +787,11 @@ def get_ai_settings():
 
 @router.put("/api/admin/ai/settings", tags=["AI"], dependencies=[admin])
 def put_ai_settings(body: AISettingsIn):
-    if body.base_url and urllib.parse.urlparse(body.base_url).scheme not in ("http", "https"):
-        raise HTTPException(400, "接口地址需以 http:// 或 https:// 开头")
+    if body.base_url:
+        origin = http_origin(body.base_url.strip())
+        local_http = origin and AI_ALLOW_LOOPBACK_HTTP and origin[1] in {"127.0.0.1", "::1"}
+        if not origin or (origin[0] != "https" and not local_http):
+            raise HTTPException(400, "模型接口需要有效的 HTTPS 地址")
     values = {
         "ai_enabled": "1" if body.enabled else "0",
         "ai_base_url": body.base_url.strip(),
@@ -862,8 +881,9 @@ def kb_status(site_id: int):
     if not site:
         raise HTTPException(404, "站点不存在")
     with get_db() as db:
+        length = "CHAR_LENGTH" if MYSQL else "LENGTH"
         pages = rows(db.execute(
-            "SELECT url, title, LENGTH(text) AS chars, fetched_at FROM kb_pages WHERE site_id = ? ORDER BY url", (site_id,)))
+            f"SELECT url, title, {length}(text) AS chars, fetched_at FROM kb_pages WHERE site_id = ? ORDER BY url", (site_id,)))
     return {"starts": crawl_starts(site), "pages": pages, "state": crawl_state.get(site_id, {})}
 
 

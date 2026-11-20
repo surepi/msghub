@@ -332,18 +332,31 @@ class QQDeliveryTests(unittest.IsolatedAsyncioTestCase):
         import json
         import time
         from unittest.mock import AsyncMock
+        from fastapi import HTTPException
         from starlette.requests import Request
         from app import chat, qq_inbound
+        callback_key = "test-callback-key-for-qq-regression"
+        self.enterContext(patch.object(self.qq, "QQ_CALLBACK_KEY", callback_key))
+        challenge = {
+            "op": 13, "d": {"event_ts": str(int(time.time())), "plain_token": "platform-challenge"},
+        }
+        receive = AsyncMock(return_value={"type": "http.request", "body": json.dumps(challenge).encode()})
+        with self.assertRaises(HTTPException) as rejected:
+            await self.qq.callback(Request({"type": "http", "headers": []}, receive), "unknown-key")
+        self.assertEqual(rejected.exception.status_code, 404)
+        result = await self.qq.callback(Request({"type": "http", "headers": []}, receive), callback_key)
+        self.assertEqual(result["plain_token"], "platform-challenge")
         cid, _ = self.conversation("test visitor")
         data = {"id":"platform-message", "author":{"user_openid":"test-agent"}, "content":f"#{cid} preserved reply"}
-        async def callback(envelope_id):
+        async def callback(envelope_id, *, age=0):
             body = json.dumps({"op":0,"id":envelope_id,"t":"C2C_MESSAGE_CREATE","d":data}).encode()
-            timestamp = str(int(time.time()))
+            timestamp = str(int(time.time()) - age)
             signature = self.qq._key.sign(timestamp.encode()+body).hex()
             receive = AsyncMock(return_value={"type":"http.request","body":body})
             return await self.qq.callback(Request({"type":"http","headers":[
                 (b"x-signature-timestamp",timestamp.encode()),
-                (b"x-signature-ed25519",signature.encode())]},receive))
+                (b"x-signature-ed25519",signature.encode())]},receive), callback_key)
+        self.assertEqual((await callback("expired-event", age=3600)).status_code, 401)
         self.assertEqual(await callback("envelope-1"),{"op":12})
         self.assertEqual(self.inbound_rows()[0]["status"],"pending")
         self.assertEqual(len(chat.history(cid)),1)
@@ -770,7 +783,7 @@ class QQDeliveryTests(unittest.IsolatedAsyncioTestCase):
             removed_url: 410,
         }
 
-        def fetch(url, _hosts=None):
+        def fetch(url, _hosts):
             result = responses[url]
             if isinstance(result, int):
                 raise HTTPError(url, result, "Fixture response", {}, None)

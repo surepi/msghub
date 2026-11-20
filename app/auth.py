@@ -1,15 +1,16 @@
-import base64
-import hashlib
 import hmac
+import secrets
+import threading
 import time
 
 from fastapi import Header, HTTPException
 
-from .config import ADMIN_PASSWORD, SECRET_KEY, TOKEN_TTL_SECONDS
+from .config import ADMIN_PASSWORD, TOKEN_TTL_SECONDS
 
 
-def _sign(payload: str) -> str:
-    return hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+_sessions: dict[str, float] = {}
+_lock = threading.Lock()
+_MAX_SESSIONS = 256
 
 
 def check_password(pw: str) -> bool:
@@ -17,22 +18,42 @@ def check_password(pw: str) -> bool:
 
 
 def issue_token() -> str:
-    exp = str(int(time.time()) + TOKEN_TTL_SECONDS)
-    raw = f"admin.{exp}"
-    return base64.urlsafe_b64encode(f"{raw}.{_sign(raw)}".encode()).decode()
+    with _lock:
+        now = time.monotonic()
+        for token, expiry in list(_sessions.items()):
+            if expiry <= now:
+                _sessions.pop(token)
+        if len(_sessions) >= _MAX_SESSIONS:
+            _sessions.pop(next(iter(_sessions)))
+        token = secrets.token_urlsafe(32)
+        _sessions[token] = now + TOKEN_TTL_SECONDS
+        return token
+
+
+def session_remaining(token: str) -> float:
+    with _lock:
+        remaining = _sessions.get(token, 0) - time.monotonic()
+        if remaining <= 0:
+            _sessions.pop(token, None)
+        return max(0, remaining)
 
 
 def verify_token(token: str) -> bool:
-    try:
-        sub, exp, sig = base64.urlsafe_b64decode(token.encode()).decode().split(".")
-    except Exception:
-        return False
-    if not hmac.compare_digest(sig, _sign(f"{sub}.{exp}")):
-        return False
-    return int(exp) > time.time()
+    return session_remaining(token) > 0
 
 
-def require_admin(authorization: str = Header(default="")):
-    token = authorization.removeprefix("Bearer ").strip()
-    if not token or not verify_token(token):
+def revoke_token(token: str):
+    with _lock:
+        _sessions.pop(token, None)
+
+
+def bearer(authorization: str) -> str:
+    scheme, _, token = authorization.partition(" ")
+    return token.strip() if scheme.lower() == "bearer" else ""
+
+
+def require_admin(authorization: str = Header(default="")) -> str:
+    token = bearer(authorization)
+    if not verify_token(token):
         raise HTTPException(status_code=401, detail="未登录或登录已过期")
+    return token

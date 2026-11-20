@@ -143,7 +143,14 @@
     } catch (err) { $("#loginErr").textContent = err.message; }
     finally { button.disabled = false; }
   });
-  $("#logout").onclick = logout;
+  $("#logout").onclick = async () => {
+    try {
+      await api("/api/admin/logout", { method: "POST" });
+      logout();
+    } catch (error) {
+      toast(error.message);
+    }
+  };
 
   // ---------- 路由 ----------
   function route() {
@@ -923,7 +930,7 @@
         <code>QQ_APP_SECRET</code> 后重启服务，客服即可在 QQ 上收发访客消息。</p><button class="btn sm" data-qq="deliveries">查看投递记录</button>`;
       return;
     }
-    const cb = location.origin + s.callback_path;
+    const cb = s.callback_path ? location.origin + s.callback_path : "";
     const ok = (b, yes, no) => b ? `<span class="tag handled">${yes}</span>` : `<span class="tag spam">${no}</span>`;
     box.innerHTML = `
       <div class="site-head"><h3>QQ 机器人</h3>${ok(s.token_ok, "凭据有效", "凭据无效")}
@@ -932,8 +939,9 @@
       <dl class="kv">
         <dt>AppID</dt><dd>${esc(s.app_id)}</dd>
         ${s.token_ok ? "" : `<dt>错误</dt><dd>${esc(s.token_error)}</dd>`}
-        <dt>回调地址</dt><dd><code>${esc(cb)}</code> <button class="btn sm ghost" data-qq="copy">复制</button>
-          <br><small class="muted">填到 q.qq.com 机器人管理后台的回调地址配置中，并订阅单聊消息事件（C2C_MESSAGE_CREATE）</small></dd>
+        <dt>回调地址</dt><dd>${cb ? `<code>${esc(cb)}</code> <button class="btn sm ghost" data-qq="copy">复制</button>
+          <br><small class="muted">仅在 q.qq.com 机器人后台填写此地址并订阅单聊消息事件，请保密</small>`
+          : "尚未启用接收。请设置 QQ_CALLBACK_KEY 后重新部署。"}</dd>
         <dt>最近回调</dt><dd>${esc(s.last_event_at) || "还没收到过平台回调"}</dd>
         <dt>客服</dt><dd>${s.bound
           ? `${esc(s.openid)} · 绑定于 ${esc(s.bound_at)} · ${s.online ? "在线" : "忙碌"}
@@ -1329,9 +1337,9 @@
     chat.msgIds.add(m.id);
     $("[data-empty-chat]", box)?.remove();
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-    const isImg = m.msg_type === "image" && /^\/uploads\/[\w.]+$/.test(m.content);
+    const isImg = m.msg_type === "image" && /^\/api\/media\/\d+\?/.test(m.image_url || "");
     const body = isImg
-      ? `<a href="${esc(m.content)}" target="_blank" rel="noopener"><img src="${esc(m.content)}" alt="图片" loading="lazy"></a>`
+      ? `<a href="${esc(m.image_url)}" target="_blank" rel="noopener noreferrer"><img src="${esc(m.image_url)}" alt="图片" loading="lazy" referrerpolicy="no-referrer"></a>`
       : esc(m.content);
     box.insertAdjacentHTML("beforeend", `<div class="msg ${esc(m.sender)}${m.id === chat.focusMessageId ? " search-target" : ""}" data-message-id="${m.id}">${m.sender === "ai" ? '<div class="who">AI 助手</div>' : ""}
       <div class="bub${isImg ? " img" : ""}">${body}${

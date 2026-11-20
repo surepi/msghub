@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from . import auth, chat, media
-from .db import get_db, rows
+from .db import NOW_SQL, get_db, rows
 
 router = APIRouter()
 admin = Depends(auth.require_admin)
@@ -35,7 +35,7 @@ class ImageUnavailable(Exception):
 
 def _finish(db, delivery_id):
     db.execute("UPDATE qq_deliveries SET status='sent', last_error='', next_attempt_at=0, "
-               "sent_at=datetime('now','localtime'), updated_at=datetime('now','localtime') WHERE id=?", (delivery_id,))
+               f"sent_at={NOW_SQL}, updated_at={NOW_SQL} WHERE id=?", (delivery_id,))
     first = db.execute("SELECT qq_message_id FROM qq_delivery_parts WHERE delivery_id=? AND status='sent' AND qq_message_id!='' ORDER BY sequence LIMIT 1", (delivery_id,)).fetchone()
     db.execute("UPDATE chat_messages SET qq_state='sent', qq_message_id=? WHERE id IN "
                "(SELECT message_id FROM qq_delivery_messages WHERE delivery_id=?)", (first[0] if first else '', delivery_id))
@@ -47,7 +47,7 @@ def recover():
         if db.execute("SELECT 1 FROM qq_deliveries WHERE status='sending' LIMIT 1").fetchone():
             db.execute('UPDATE qq_agent SET current_conv_id=NULL, current_set_at=0 WHERE id=1')
         db.execute("UPDATE qq_delivery_parts SET status='uncertain', last_error='服务在发送期间重启，投递结果未确认' WHERE status='sending'")
-        db.execute("UPDATE qq_deliveries SET status='uncertain', last_error='服务在发送期间重启，请先核对 QQ 收件情况', next_attempt_at=0, updated_at=datetime('now','localtime') "
+        db.execute(f"UPDATE qq_deliveries SET status='uncertain', last_error='服务在发送期间重启，请先核对 QQ 收件情况', next_attempt_at=0, updated_at={NOW_SQL} "
                    "WHERE status='sending' AND EXISTS (SELECT 1 FROM qq_delivery_parts p WHERE p.delivery_id=qq_deliveries.id AND p.status='uncertain')")
         for r in db.execute("SELECT id FROM qq_deliveries WHERE status='sending'").fetchall():
             if db.execute("SELECT 1 FROM qq_delivery_parts WHERE delivery_id=? AND status NOT IN ('sent','skipped')", (r[0],)).fetchone():
@@ -59,7 +59,7 @@ def recover():
 def cancel_for_binding_change(*, db=None):
     """Caller holds queue_lock; pending content must not move to a different QQ account."""
     with (get_db() if db is None else nullcontext(db)) as db:
-        db.execute("UPDATE qq_deliveries SET status='cancelled', last_error='客服绑定已变更，停止此投递', next_attempt_at=0, updated_at=datetime('now','localtime') WHERE status NOT IN ('sent','cancelled')")
+        db.execute(f"UPDATE qq_deliveries SET status='cancelled', last_error='客服绑定已变更，停止此投递', next_attempt_at=0, updated_at={NOW_SQL} WHERE status NOT IN ('sent','cancelled')")
         db.execute("UPDATE chat_messages SET qq_state='' WHERE qq_state='pending'")
         db.execute("DELETE FROM conversation_triage_jobs")
         db.execute("UPDATE qq_inbound SET status='cancelled',payload=NULL WHERE status='pending'")
@@ -161,7 +161,7 @@ def _cancel_obsolete_handoff(db, job):
     latest_agent = db.execute("SELECT MAX(id) FROM chat_messages WHERE conversation_id=? AND sender='agent'", (job['conversation_id'],)).fetchone()[0] or 0
     if not conv or conv['status'] == 'closed' or not inbox or inbox['status'] in ('handled', 'spam') or latest_agent > source_upto:
         db.execute("UPDATE qq_deliveries SET status='cancelled', last_error='会话已接管/结束或来源留言已处理/删除，停止补发转人工通知', "
-                   "next_attempt_at=0, updated_at=datetime('now','localtime') WHERE id=?", (job['id'],))
+                   f"next_attempt_at=0, updated_at={NOW_SQL} WHERE id=?", (job['id'],))
         return True
     return False
 
@@ -197,7 +197,7 @@ async def _run(delivery_id, *, manual=False):
         await _changed(delivery_id, job['conversation_id'])
         return True
     with get_db() as db:
-        db.execute("UPDATE qq_deliveries SET status='sending', attempts=attempts+1, last_attempt_at=?, updated_at=datetime('now','localtime') WHERE id=?", (time.time(), delivery_id))
+        db.execute(f"UPDATE qq_deliveries SET status='sending', attempts=attempts+1, last_attempt_at=?, updated_at={NOW_SQL} WHERE id=?", (time.time(), delivery_id))
     await _changed(delivery_id, job['conversation_id'])
     try:
         while True:
@@ -233,7 +233,7 @@ async def _run(delivery_id, *, manual=False):
                 delay = min(900, 30 * 2 ** min(job['attempts'], 5))
                 with get_db() as db:
                     db.execute("UPDATE qq_delivery_parts SET status=?, last_error=? WHERE id=?", (state, error, part['id']))
-                    db.execute("UPDATE qq_deliveries SET status=?, last_error=?, next_attempt_at=?, updated_at=datetime('now','localtime') WHERE id=?",
+                    db.execute(f"UPDATE qq_deliveries SET status=?, last_error=?, next_attempt_at=?, updated_at={NOW_SQL} WHERE id=?",
                                (state, error, 0 if uncertain else time.time() + delay, delivery_id))
                 if uncertain:
                     # The agent may see a new conversation header despite the missing receipt.
@@ -243,7 +243,7 @@ async def _run(delivery_id, *, manual=False):
                     raise
                 return False
             with get_db() as db:
-                db.execute("UPDATE qq_delivery_parts SET status='sent', qq_message_id=?, last_error='', sent_at=datetime('now','localtime') WHERE id=?", (message_id, part['id']))
+                db.execute(f"UPDATE qq_delivery_parts SET status='sent', qq_message_id=?, last_error='', sent_at={NOW_SQL} WHERE id=?", (message_id, part['id']))
             if qq.agent()['current_conv_id'] != job['conversation_id']:
                 qq.update_agent(current_conv_id=job['conversation_id'], current_set_at=time.time())
     finally:
@@ -315,7 +315,7 @@ def delivery_detail(delivery_id: int):
         parts = rows(db.execute('SELECT id,sequence,kind,content,status,attempts,last_error,qq_message_id,manually_confirmed,sent_at FROM qq_delivery_parts WHERE delivery_id=? ORDER BY sequence', (delivery_id,)))
         messages = rows(db.execute('SELECT * FROM (SELECT m.id,m.content,m.msg_type,m.created_at FROM chat_messages m WHERE m.id IN '
                                   '(SELECT message_id FROM qq_delivery_messages WHERE delivery_id=? UNION '
-                                  'SELECT message_id FROM qq_notification_sources WHERE delivery_id=?) ORDER BY m.id DESC LIMIT 100) ORDER BY id', (delivery_id,delivery_id)))
+                                  'SELECT message_id FROM qq_notification_sources WHERE delivery_id=?) ORDER BY m.id DESC LIMIT 100) AS recent ORDER BY id', (delivery_id,delivery_id)))
     return {'delivery': dict(job), 'parts': parts, 'messages': messages, 'messages_truncated': job['message_count'] > len(messages)}
 
 
@@ -365,10 +365,10 @@ async def confirm_received(delivery_id: int):
                 raise HTTPException(404, '投递记录不存在')
             if job['status'] != 'uncertain':
                 raise HTTPException(409, '只有投递结果未确认的记录可以人工确认')
-            db.execute("UPDATE qq_delivery_parts SET status='sent', manually_confirmed=1, last_error='', sent_at=datetime('now','localtime') WHERE delivery_id=? AND status='uncertain'", (delivery_id,))
+            db.execute(f"UPDATE qq_delivery_parts SET status='sent', manually_confirmed=1, last_error='', sent_at={NOW_SQL} WHERE delivery_id=? AND status='uncertain'", (delivery_id,))
             remaining = db.execute("SELECT 1 FROM qq_delivery_parts WHERE delivery_id=? AND status NOT IN ('sent','skipped')", (delivery_id,)).fetchone()
             if remaining:
-                db.execute("UPDATE qq_deliveries SET status='pending', last_error='', next_attempt_at=0, updated_at=datetime('now','localtime') WHERE id=?", (delivery_id,))
+                db.execute(f"UPDATE qq_deliveries SET status='pending', last_error='', next_attempt_at=0, updated_at={NOW_SQL} WHERE id=?", (delivery_id,))
             else:
                 _finish(db, delivery_id)
         await _changed(delivery_id, job['conversation_id'])

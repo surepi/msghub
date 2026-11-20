@@ -8,7 +8,7 @@ from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from . import auth, chat, summaries
-from .db import get_db, get_setting, rows
+from .db import GREATEST_SQL, MYSQL, begin_write, get_db, get_setting, insert_once, rows, save_snapshot, since
 
 router = APIRouter()
 admin = Depends(auth.require_admin)
@@ -104,7 +104,8 @@ def _apply_tags(db, item, *, manual=False):
             db.execute('DELETE FROM conversation_ai_tag_blocks WHERE conversation_id=? AND tag_id=?',(item['conversation_id'],tag['id']))
         elif db.execute('SELECT 1 FROM conversation_ai_tag_blocks WHERE conversation_id=? AND tag_id=?',(item['conversation_id'],tag['id'])).fetchone():
             continue
-        if db.execute('INSERT OR IGNORE INTO conversation_tags (conversation_id,tag_id) VALUES (?,?)',(item['conversation_id'],tag['id'])).rowcount:
+        if insert_once(db, 'INSERT INTO conversation_tags (conversation_id,tag_id) VALUES (?,?)',
+                       (item['conversation_id'], tag['id'])):
             added.append(tag['id'])
     return added
 
@@ -117,7 +118,8 @@ def enqueue_priority(db, conv, item):
     # One alert per 30 minutes while waiting for an agent; a reply starts a new waiting round.
     last_agent=db.execute("SELECT COALESCE(MAX(id),0) FROM chat_messages WHERE conversation_id=? AND sender='agent'",(conv['id'],)).fetchone()[0]
     if db.execute("SELECT 1 FROM qq_deliveries d JOIN conversation_triage t ON t.id=d.triage_id WHERE d.conversation_id=? AND d.kind='priority' "
-                  "AND d.status!='cancelled' AND t.source_upto>? AND d.created_at>=datetime('now','localtime','-30 minutes')",(conv['id'],last_agent)).fetchone():
+                  "AND d.status!='cancelled' AND t.source_upto>? AND d.created_at>=?",
+                  (conv['id'],last_agent,since(minutes=30))).fetchone():
         return None
     ev=item['priority_evidence']
     reason='AI 判断高优先级（供核对）'
@@ -184,14 +186,14 @@ async def generate(cid, *, automatic=False, job_recipient=None):
             payload.update(status='error',error_code='invalid_output')
         jid=None
         with get_db() as db:
-            db.execute('BEGIN IMMEDIATE')
+            begin_write(db)
             state=db.execute('SELECT status,ai_priority_dismissed_upto FROM conversations WHERE id=?',(cid,)).fetchone()
             if not state:
                 raise HTTPException(404,'会话已删除')
             keys=('conversation_id','source_upto','status','error_code','model','category','category_evidence','priority','priority_evidence','tag_suggestions','sources','source_count','truncated')
-            values=[json.dumps(payload[k],ensure_ascii=False) if isinstance(payload[k],(list,dict)) else payload[k] for k in keys]
-            db.execute('INSERT INTO conversation_triage ('+','.join(keys)+') VALUES ('+','.join('?' for _ in keys)+') '
-                       'ON CONFLICT(conversation_id,source_upto) DO UPDATE SET '+','.join(k+'=excluded.'+k for k in keys[2:])+",created_at=datetime('now','localtime') WHERE conversation_triage.status!='ready'",values)
+            values = {key: json.dumps(payload[key], ensure_ascii=False) if isinstance(payload[key], (list, dict))
+                      else payload[key] for key in keys}
+            save_snapshot(db, 'conversation_triage', values)
             item=decode(dict(db.execute('SELECT * FROM conversation_triage WHERE conversation_id=? AND source_upto=?',(cid,upto)).fetchone()))
             if item['priority']=='high' and state['ai_priority_dismissed_upto']>=item['priority_evidence'].get('message_id',upto):
                 db.execute('UPDATE conversation_triage SET dismissed=1 WHERE id=?',(item['id'],))
@@ -221,9 +223,14 @@ async def on_visitor_message(conv,msg):
     from . import auto
     if not enabled() or not auto.ai_ready(chat.get_site(conv['site_id']) or {}):
         return
+    if MYSQL:
+        upsert = ('ON DUPLICATE KEY UPDATE source_upto=VALUES(source_upto),'
+                  'due_at=GREATEST(VALUES(due_at),last_run_at+30),attempts=0')
+    else:
+        upsert = ('ON CONFLICT(conversation_id) DO UPDATE SET source_upto=excluded.source_upto,'
+                  'due_at=MAX(excluded.due_at,conversation_triage_jobs.last_run_at+30),attempts=0')
     with get_db() as db:
-        db.execute('INSERT INTO conversation_triage_jobs (conversation_id,source_upto,due_at) VALUES (?,?,?) '
-                   'ON CONFLICT(conversation_id) DO UPDATE SET source_upto=excluded.source_upto,due_at=MAX(excluded.due_at,conversation_triage_jobs.last_run_at+30),attempts=0',
+        db.execute('INSERT INTO conversation_triage_jobs (conversation_id,source_upto,due_at) VALUES (?,?,?) ' + upsert,
                    (conv['id'],msg['id'],time.time()+2))
 
 
@@ -293,7 +300,7 @@ async def run_triage(cid:int):
 @router.post('/api/admin/conversations/{cid}/triage/{analysis_id}/apply-tags',dependencies=[admin],tags=['AI'])
 async def apply_tags(cid:int,analysis_id:int):
     with get_db() as db:
-        db.execute('BEGIN IMMEDIATE')
+        begin_write(db)
         row=db.execute("SELECT * FROM conversation_triage WHERE id=? AND conversation_id=? AND status='ready'",(analysis_id,cid)).fetchone()
         if not row:
             raise HTTPException(404,'有效分类记录不存在')
@@ -309,9 +316,9 @@ async def apply_tags(cid:int,analysis_id:int):
 async def dismiss(cid:int):
     detail(cid)
     with get_db() as db:
-        db.execute('BEGIN IMMEDIATE')
+        begin_write(db)
         upto=visitor_upto(db,cid)
-        db.execute('UPDATE conversations SET ai_priority_dismissed_upto=MAX(ai_priority_dismissed_upto,?) WHERE id=?',(upto,cid))
+        db.execute(f'UPDATE conversations SET ai_priority_dismissed_upto={GREATEST_SQL}(ai_priority_dismissed_upto,?) WHERE id=?',(upto,cid))
         db.execute("UPDATE conversation_triage SET dismissed=1 WHERE conversation_id=? AND priority='high'",(cid,))
         db.execute("UPDATE qq_deliveries SET status='cancelled',next_attempt_at=0,last_error='客服已取消高优先级提醒' WHERE conversation_id=? AND kind='priority' AND status NOT IN ('sent','cancelled','sending')",(cid,))
     await changed(cid)

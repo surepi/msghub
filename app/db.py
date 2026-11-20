@@ -1,9 +1,15 @@
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 
-from .config import DB_PATH
+from .config import DB_BACKEND, DB_INIT_SCHEMA, DB_PATH
+from .mysql_db import DuplicateKeyError
 
-READ_CURSOR_SCHEMA_VERSION = "2"
+MYSQL = DB_BACKEND == "mysql"
+NOW_SQL = "CURRENT_TIMESTAMP" if MYSQL else "datetime('now','localtime')"
+GREATEST_SQL = "GREATEST" if MYSQL else "MAX"
+DEFAULT_TAGS = ("待报价", "售后", "投诉", "重点客户", "已转化")
+SCHEMA_VERSION = "2"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sites (
@@ -304,10 +310,18 @@ CREATE TABLE IF NOT EXISTS conversation_tags (
     PRIMARY KEY (conversation_id, tag_id)
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_tags_tag ON conversation_tags(tag_id, conversation_id);
+
+CREATE TABLE IF NOT EXISTS pending_uploads (
+    path TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_uploads_expiry ON pending_uploads(expires_at);
 """
 
 # 老库迁移：表 → [(列名, 定义)]
 MIGRATIONS = {
+    "visitors": [("site_id", "INTEGER REFERENCES sites(id) ON DELETE CASCADE")],
     "qq_agent": [("binding_version", "INTEGER NOT NULL DEFAULT 0")],
     "qq_deliveries": [
         ("triage_id", "INTEGER REFERENCES conversation_triage(id) ON DELETE SET NULL"),
@@ -349,7 +363,10 @@ ADMIN_MESSAGE_SQL = (
 )
 
 
-def connect() -> sqlite3.Connection:
+def connect():
+    if MYSQL:
+        from . import mysql_db
+        return mysql_db.connect()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -367,15 +384,16 @@ def get_db():
         conn.close()
 
 
-def begin_write(db):
-    db.execute("BEGIN IMMEDIATE")
-
-
-def _migrate_read_cursor(conn):
-    state = conn.execute("SELECT value FROM settings WHERE `key` = ?", ("read_cursor_version",)).fetchone()
+def _migrate_schema(conn):
+    state = conn.execute("SELECT value FROM settings WHERE `key` = ?", ("schema_version",)).fetchone()
     version = state[0] if state else None
-    if version == READ_CURSOR_SCHEMA_VERSION:
+    if version == SCHEMA_VERSION:
         return
+    if version is None:
+        conn.execute(
+            "UPDATE visitors SET site_id = (SELECT MIN(c.site_id) FROM conversations c "
+            "WHERE c.visitor_id = visitors.id HAVING COUNT(DISTINCT c.site_id) = 1) WHERE site_id IS NULL"
+        )
     # The last unread visitor messages remain unread when upgrading from a count.
     legacy = conn.execute(
         "SELECT c.id, c.unread, COUNT(m.id), COALESCE(MAX(CASE WHEN m.visitor_rank > c.unread THEN m.id END), 0) "
@@ -386,13 +404,21 @@ def _migrate_read_cursor(conn):
     ).fetchall()
     conn.executemany("UPDATE conversations SET unread=?, read_upto=? WHERE id=?",
                      [(min(unread, count), upto, cid) for cid, unread, count, upto in legacy])
-    conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
-                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                 ("read_cursor_version", READ_CURSOR_SCHEMA_VERSION))
+    insert_once(conn, "INSERT INTO settings (`key`, value) VALUES (?, ?)", ("schema_version", SCHEMA_VERSION))
+    conn.execute("UPDATE settings SET value = ? WHERE `key` = ?", (SCHEMA_VERSION, "schema_version"))
 
 
-def init_db():
+def init_db(*, migrate: bool = DB_INIT_SCHEMA):
     with get_db() as conn:
+        if MYSQL:
+            from . import mysql_db
+            if migrate:
+                mysql_db.init_db(conn, DEFAULT_TAGS)
+                _migrate_schema(conn)
+            elif not conn.execute("SELECT 1 FROM settings WHERE `key` = ? AND value = ?",
+                                  ("schema_version", SCHEMA_VERSION)).fetchone():
+                raise RuntimeError("数据库需要迁移，请先使用迁移账号运行 python -m app.db")
+            return
         new_tags = not conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tags'"
         ).fetchone()
@@ -400,7 +426,7 @@ def init_db():
         begin_write(conn)
         if new_tags:
             conn.executemany("INSERT INTO tags (name) VALUES (?)",
-                             [(name,) for name in ("待报价", "售后", "投诉", "重点客户", "已转化")])
+                             [(name,) for name in DEFAULT_TAGS])
         for table, columns in MIGRATIONS.items():
             have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
             for name, ddl in columns:
@@ -409,19 +435,58 @@ def init_db():
         # The legacy messages.conversation_id column must exist before creating this index.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, site_id, id)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_qq_delivery_event ON qq_deliveries(event_key) WHERE event_key IS NOT NULL")
-        _migrate_read_cursor(conn)
+        _migrate_schema(conn)
 
 
 def get_setting(key: str, default: str = "") -> str:
     with get_db() as db:
-        r = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        r = db.execute("SELECT value FROM settings WHERE `key` = ?", (key,)).fetchone()
     return r[0] if r else default
 
 
 def set_settings(values: dict[str, str]):
+    upsert = ("ON DUPLICATE KEY UPDATE value = VALUES(value)" if MYSQL else
+              "ON CONFLICT(`key`) DO UPDATE SET value = excluded.value")
     with get_db() as db:
-        db.executemany("INSERT INTO settings (key, value) VALUES (?, ?) "
-                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value", list(values.items()))
+        db.executemany("INSERT INTO settings (`key`, value) VALUES (?, ?) " + upsert, list(values.items()))
+
+
+def begin_write(db):
+    if MYSQL:
+        db.begin_write()
+    else:
+        db.execute("BEGIN IMMEDIATE")
+
+
+def insert_once(db, sql, params):
+    if MYSQL:
+        try:
+            db.execute(sql, params)
+        except DuplicateKeyError:
+            return False
+        return True
+    return bool(db.execute(sql + " ON CONFLICT DO NOTHING", params).rowcount)
+
+
+def save_snapshot(db, table, values):
+    # Keep successful snapshots immutable. In MySQL, status is assigned last so every
+    # assignment can inspect the original status.
+    updates = [key for key in values if key not in {"conversation_id", "source_upto", "status"}]
+    updates.extend(("created_at", "status"))
+    if MYSQL:
+        expressions = (f"{key}=IF(status='ready',{key},VALUES({key}))" for key in updates)
+        upsert = "ON DUPLICATE KEY UPDATE " + ",".join(expressions)
+    else:
+        expressions = (f"{key}=excluded.{key}" for key in updates)
+        upsert = ("ON CONFLICT(conversation_id,source_upto) DO UPDATE SET "
+                  + ",".join(expressions) + f" WHERE {table}.status!='ready'")
+    columns = ",".join(values)
+    marks = ",".join("?" for _ in values)
+    db.execute(f"INSERT INTO {table} ({columns}) VALUES ({marks}) {upsert}", tuple(values.values()))
+
+
+def since(**offset):
+    return (datetime.now() - timedelta(**offset)).isoformat(sep=" ", timespec="seconds")
 
 
 def rows(cur) -> list[dict]:
@@ -429,4 +494,4 @@ def rows(cur) -> list[dict]:
 
 
 if __name__ == "__main__":
-    init_db()
+    init_db(migrate=True)

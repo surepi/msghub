@@ -7,7 +7,7 @@ from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from . import auth, chat
-from .db import get_db, rows
+from .db import begin_write, get_db, rows, save_snapshot
 
 router = APIRouter()
 _locks = defaultdict(asyncio.Lock)
@@ -114,15 +114,12 @@ async def prepare(conv_id, upto=None):
 def save(db, payload):
     if not payload:
         return None
-    # Successful snapshots are immutable; a failed attempt may be replaced on explicit retry.
-    db.execute('INSERT INTO conversation_summaries (conversation_id,source_upto,status,error_code,model,summary,needs,contacts,sources,source_count,truncated) '
-               'VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(conversation_id,source_upto) DO UPDATE SET '
-               'status=excluded.status,error_code=excluded.error_code,model=excluded.model,summary=excluded.summary,needs=excluded.needs,'
-               "contacts=excluded.contacts,sources=excluded.sources,source_count=excluded.source_count,truncated=excluded.truncated,created_at=datetime('now','localtime') "
-               "WHERE conversation_summaries.status!='ready'",
-               (payload['conversation_id'], payload['source_upto'], payload['status'], payload['error_code'], payload['model'], payload['summary'],
-                json.dumps(payload['needs'], ensure_ascii=False), json.dumps(payload['contacts'], ensure_ascii=False),
-                json.dumps(payload['sources'], ensure_ascii=False), payload['source_count'], int(payload['truncated'])))
+    keys = ('conversation_id', 'source_upto', 'status', 'error_code', 'model', 'summary',
+            'needs', 'contacts', 'sources', 'source_count', 'truncated')
+    values = {key: payload[key] for key in keys}
+    for key in ('needs', 'contacts', 'sources'):
+        values[key] = json.dumps(values[key], ensure_ascii=False)
+    save_snapshot(db, 'conversation_summaries', values)
     return decode(dict(db.execute('SELECT * FROM conversation_summaries WHERE conversation_id=? AND source_upto=?',
                                  (payload['conversation_id'], payload['source_upto'])).fetchone()))
 
@@ -155,6 +152,7 @@ async def generate(conv_id):
             raise HTTPException(400, '请开启全局和本站 AI 并完成模型配置，且会话需有聊天消息')
         with get_db() as db:
             # A deleted conversation must not be recreated after a slow model response.
+            begin_write(db)
             if not db.execute('SELECT 1 FROM conversations WHERE id=?', (conv_id,)).fetchone():
                 raise HTTPException(404, '会话已删除')
             item = save(db, payload)

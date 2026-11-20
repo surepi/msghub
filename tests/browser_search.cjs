@@ -31,7 +31,7 @@ with sqlite3.connect(DB_PATH) as db:
         site_id=int(sys.argv[1 if i<34 else 2])
         visitor_token=secrets.token_hex(16)
         if i==0: target_token=visitor_token
-        v=db.execute('INSERT INTO visitors (token,name,contact) VALUES (?,?,?)',(visitor_token,'分页客户'+str(i),'customer'+str(i)+'@example.com')).lastrowid
+        v=db.execute('INSERT INTO visitors (site_id,token,name,contact) VALUES (?,?,?,?)',(site_id,visitor_token,'分页客户'+str(i),'customer'+str(i)+'@example.com')).lastrowid
         c=db.execute("INSERT INTO conversations (site_id,visitor_id,last_preview,last_msg_at,unread) VALUES (?,?,?,'2026-02-11 12:00:00',1)",(site_id,v,'最新消息不含关键词')).lastrowid
         convs.append(c)
         for j in range(620 if i==0 else 2):
